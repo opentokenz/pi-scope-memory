@@ -287,6 +287,8 @@ cd ~/Projects/enterprise
 - 学习调用走 `ctx.modelRegistry.streamSimple(..., { reasoning })`，复用 Pi 已配置的 Provider，不硬编码 Anthropic。
 - 模型未声明 `reasoning` 时 `/sm model` 会提示强度可能被 Provider 忽略。
 
+通过 `/sm model` 修改的模型和思考强度会立即作用于当前会话，下一次学习批次就使用新值。手工编辑 `config.json` 后需要 `/reload` 或新会话才会生效。
+
 主 Agent 的思考强度仍由 Pi 内置的 `/thinking` 控制；这里设置的是后台学习调用的强度。
 
 ## 自动学习

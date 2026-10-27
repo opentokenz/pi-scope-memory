@@ -73,6 +73,7 @@ function makeCtx(
 		complete?: () => Promise<unknown>;
 		hasUI?: boolean;
 		select?: (title: string, items: string[]) => Promise<string | undefined>;
+		streamSimple?: (...args: unknown[]) => { result: () => Promise<unknown> };
 	} = {},
 ): ExtensionContext {
 	return {
@@ -86,6 +87,11 @@ function makeCtx(
 			complete: options.complete ?? (async () => assistantMessage("[]")),
 			find: (provider: string, id: string) => (provider === "nope" ? undefined : { provider, id }),
 			hasConfiguredAuth: () => true,
+			streamSimple:
+				options.streamSimple ??
+				((_model: unknown, _context: unknown, _options: unknown) => ({
+					result: async () => assistantMessage("[]"),
+				})),
 			getAvailable: () => [
 				{ provider: "anthropic", id: "test-model" },
 				{ provider: "openai", id: "gpt-x" },
@@ -326,6 +332,43 @@ test("/sm model 在交互模式下用选择器选择模型与思考强度", asyn
 	assert.ok(notices.some((notice) => notice.includes("已取消")));
 	const afterCancel = loadConfig();
 	if (afterCancel.status === "loaded") assert.equal(afterCancel.config.defaults.learningModel, "openai/gpt-x");
+	await h.shutdown();
+});
+
+test("/sm model 修改后当前会话的学习调用立即生效", async () => {
+	const { root } = enterpriseSetup();
+	const notices: string[] = [];
+	const h = harness(notices);
+	const ctx = makeCtx(join(root, "backend"), notices, { sessionId: "learn-session" });
+	await h.sessionStart(ctx);
+
+	for (const [index, path] of ["src/a.ts", "src/b.ts", "src/c.ts"].entries()) {
+		await h.handlers.get("tool_result")?.(
+			{
+				type: "tool_result",
+				toolCallId: `obs-${index}`,
+				input: { path },
+				content: [],
+				isError: false,
+				details: undefined,
+				toolName: "edit",
+			},
+			ctx,
+		);
+	}
+
+	await h.commands.get("sm")?.handler("model --thinking high", ctx as unknown as ExtensionCommandContext);
+
+	let captured: unknown = "unset";
+	const learnCtx = makeCtx(join(root, "backend"), notices, {
+		sessionId: "learn-session",
+		streamSimple: (_model, _context, options) => {
+			captured = (options as { reasoning?: unknown }).reasoning;
+			return { result: async () => assistantMessage("[]") };
+		},
+	});
+	await h.handlers.get("agent_settled")?.({ type: "agent_settled", aborted: false }, learnCtx);
+	assert.equal(captured, "high", "同一会话内 /sm model 的设置必须立即生效");
 	await h.shutdown();
 });
 

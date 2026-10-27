@@ -79,7 +79,7 @@ export function registerSmCommand({ pi, runtime }: CommandDeps): void {
 						await handleStats(runtime, ctx);
 						return;
 					case "model":
-						await handleModel(ctx, rest);
+						await handleModel(runtime, ctx, rest);
 						return;
 				}
 			} catch (error) {
@@ -342,7 +342,11 @@ async function handleStats(runtime: MemoryRuntime, ctx: ExtensionCommandContext)
 	ctx.ui.notify(formatStats(stats, runtime.scope.scopeId, runtime.scope.repoId), "info");
 }
 
-async function handleModel(ctx: ExtensionCommandContext, rest: string): Promise<void> {
+async function handleModel(
+	runtime: MemoryRuntime,
+	ctx: ExtensionCommandContext,
+	rest: string,
+): Promise<void> {
 	const loaded = loadConfig();
 	if (loaded.status === "invalid") {
 		ctx.ui.notify(`配置文件无效，拒绝写入: ${loaded.error}`, "error");
@@ -370,7 +374,7 @@ async function handleModel(ctx: ExtensionCommandContext, rest: string): Promise<
 			ctx.ui.notify(applied.error, "error");
 			return;
 		}
-		writeConfig(config);
+		persistModelConfig(runtime, config);
 		ctx.ui.notify(applied.notes.join("\n"), "info");
 		return;
 	}
@@ -386,7 +390,7 @@ async function handleModel(ctx: ExtensionCommandContext, rest: string): Promise<
 			return;
 		}
 		config.defaults.learningThinkingLevel = picked;
-		writeConfig(config);
+		persistModelConfig(runtime, config);
 		ctx.ui.notify(
 			`学习思考强度: ${picked}${describeThinkingSupport(ctx, config.defaults.learningModel)}`,
 			"info",
@@ -416,8 +420,14 @@ async function handleModel(ctx: ExtensionCommandContext, rest: string): Promise<
 		notes.push(`学习思考强度: ${thinkingValue}${describeThinkingSupport(ctx, config.defaults.learningModel)}`);
 	}
 
-	writeConfig(config);
+	persistModelConfig(runtime, config);
 	ctx.ui.notify(notes.join("\n"), "info");
+}
+
+/** Apply the new defaults to the running session instead of waiting for /reload. */
+function persistModelConfig(runtime: MemoryRuntime, config: MemoryConfig): void {
+	writeConfig(config);
+	runtime.defaults = config.defaults;
 }
 
 type ApplyResult = { ok: true; notes: string[] } | { ok: false; error: string };
