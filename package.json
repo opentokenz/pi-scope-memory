@@ -1,0 +1,43 @@
+{
+  "name": "pi-scope-memory",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Scope-aware, evidence-driven long-term project memory for the Pi coding agent",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "memory"
+  ],
+  "license": "MIT",
+  "author": "opentokenz",
+  "homepage": "https://github.com/opentokenz/pi-scope-memory#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/opentokenz/pi-scope-memory.git"
+  },
+  "bugs": {
+    "url": "https://github.com/opentokenz/pi-scope-memory/issues"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "test": "node --test tests/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.0",
+    "typescript": "^5.9.3"
+  }
+}
