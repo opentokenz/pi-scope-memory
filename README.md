@@ -85,6 +85,12 @@ pi install /absolute/path/to/pi-scope-memory
 pi -e /absolute/path/to/pi-scope-memory
 ```
 
+如果已经通过 `pi install` 安装了发布版，本地调试时加 `-ne` 只加载显式路径，避免同名工具重复注册：
+
+```bash
+pi -ne -e /absolute/path/to/pi-scope-memory
+```
+
 安装扩展不等于启用记忆。只有执行过 `/sm init` 且目录匹配某个启用的 Scope，记忆工具才会在当前会话生效。
 
 ## 快速开始
@@ -124,7 +130,7 @@ cd ~/Projects/enterprise
 | `/sm recall [主题]` | 让 Agent 调用 `scope_memory_search` 检索历史记忆 |
 | `/sm clear --repo <repo> \| --shared \| --all [--yes]` | 预览或清理记忆 |
 | `/sm stats` | 记忆、检索、缓存、学习与成本统计 |
-| `/sm model` | 打开模型选择器，设置学习模型与思考强度 |
+| `/sm model` | 打开模型选择器，选完后继续选择思考强度 |
 
 `/sm init` 不做交互菜单，但会校验真实路径、Scope ID 和仓库路径；发现重叠或冲突时直接报错，不会猜测要覆盖哪个 Scope。以后新增仓库必须显式执行 `/sm init --repos <name>`。
 

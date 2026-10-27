@@ -22,6 +22,12 @@ npm test
 pi -e /absolute/path/to/pi-scope-memory
 ```
 
+如果本机已经通过 `pi install` 安装了发布版，本地调试请加 `-ne` 只加载显式路径，否则同名工具会重复注册：
+
+```bash
+pi -ne -e /absolute/path/to/pi-scope-memory
+```
+
 在临时项目里执行 `/sm init`，然后 `/reload`，确认 `/sm stats` 正常、未配置目录不会加载工具。
 
 ## 必须保持的设计约束

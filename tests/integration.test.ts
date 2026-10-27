@@ -290,27 +290,36 @@ test("/sm model 查看、切换与校验", async () => {
 	await h.shutdown();
 });
 
-test("/sm model 在交互模式下用选择器选择模型与思考强度", async () => {
+test("/sm model 在交互模式下先选模型，再选思考强度", async () => {
 	const { base } = enterpriseSetup();
 	const notices: string[] = [];
 	const h = harness(notices);
 	const command = h.commands.get("sm");
 	assert.ok(command);
 
-	let seenTitle = "";
+	const titles: string[] = [];
 	const modelCtx = makeCtx(base, notices, {
 		hasUI: true,
 		select: async (title, items) => {
-			seenTitle = title;
-			return items.find((item) => item.startsWith("openai/gpt-x"));
+			titles.push(title);
+			if (title.includes("选择学习模型")) {
+				return items.find((item) => item.startsWith("openai/gpt-x"));
+			}
+			return items.find((item) => item.startsWith("high"));
 		},
 	});
 	await command.handler("model", modelCtx as unknown as ExtensionCommandContext);
-	assert.match(seenTitle, /选择学习模型/);
+	assert.equal(titles.length, 2, "选完模型后应继续弹出思考强度选择器");
+	assert.match(titles[0] ?? "", /选择学习模型/);
+	assert.match(titles[1] ?? "", /选择学习思考强度/);
 	const picked = loadConfig();
 	assert.equal(picked.status, "loaded");
-	if (picked.status === "loaded") assert.equal(picked.config.defaults.learningModel, "openai/gpt-x");
+	if (picked.status === "loaded") {
+		assert.equal(picked.config.defaults.learningModel, "openai/gpt-x");
+		assert.equal(picked.config.defaults.learningThinkingLevel, "high");
+	}
 	assert.ok(notices.some((notice) => notice.includes("学习模型: openai/gpt-x")));
+	assert.ok(notices.some((notice) => notice.includes("学习思考强度: high")));
 
 	const thinkingCtx = makeCtx(base, notices, {
 		hasUI: true,
@@ -322,7 +331,21 @@ test("/sm model 在交互模式下用选择器选择模型与思考强度", asyn
 		assert.equal(afterThinking.config.defaults.learningThinkingLevel, "low");
 		assert.equal(afterThinking.config.defaults.learningModel, "openai/gpt-x");
 	}
-	assert.ok(notices.some((notice) => notice.includes("学习思考强度: low")));
+
+	const cancelThinkingCtx = makeCtx(base, notices, {
+		hasUI: true,
+		select: async (title, items) => {
+			if (title.includes("选择学习模型")) return items.find((item) => item.startsWith("anthropic/test-model"));
+			return undefined;
+		},
+	});
+	await command.handler("model", cancelThinkingCtx as unknown as ExtensionCommandContext);
+	const afterCancelThinking = loadConfig();
+	if (afterCancelThinking.status === "loaded") {
+		assert.equal(afterCancelThinking.config.defaults.learningModel, "anthropic/test-model");
+		assert.equal(afterCancelThinking.config.defaults.learningThinkingLevel, "low", "第二步取消时保留原强度");
+	}
+	assert.ok(notices.some((notice) => notice.includes("保持 low")));
 
 	const cancelCtx = makeCtx(base, notices, {
 		hasUI: true,
@@ -331,7 +354,7 @@ test("/sm model 在交互模式下用选择器选择模型与思考强度", asyn
 	await command.handler("model", cancelCtx as unknown as ExtensionCommandContext);
 	assert.ok(notices.some((notice) => notice.includes("已取消")));
 	const afterCancel = loadConfig();
-	if (afterCancel.status === "loaded") assert.equal(afterCancel.config.defaults.learningModel, "openai/gpt-x");
+	if (afterCancel.status === "loaded") assert.equal(afterCancel.config.defaults.learningModel, "anthropic/test-model");
 	await h.shutdown();
 });
 

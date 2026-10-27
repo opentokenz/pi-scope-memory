@@ -97,7 +97,7 @@ function helpText(): string {
 		"/sm recall [主题]                           让 Agent 检索相关记忆",
 		"/sm clear --repo <repo>|--shared|--all [--yes]  预览或清理记忆",
 		"/sm stats                                  查看统计",
-		"/sm model                                   打开选择器，设置学习模型与思考强度",
+		"/sm model                                   选择学习模型，随后选择思考强度",
 	].join("\n");
 }
 
@@ -374,6 +374,19 @@ async function handleModel(
 			ctx.ui.notify(applied.error, "error");
 			return;
 		}
+		// Selecting a model and then its reasoning effort is one decision; ask
+		// for the effort right away instead of requiring a second command.
+		const pickedThinking = await pickThinkingLevel(ctx, config.defaults.learningThinkingLevel);
+		if (pickedThinking === undefined) {
+			applied.notes.push(
+				`学习思考强度保持 ${config.defaults.learningThinkingLevel}（已取消选择）`,
+			);
+		} else {
+			config.defaults.learningThinkingLevel = pickedThinking;
+			applied.notes.push(
+				`学习思考强度: ${pickedThinking}${describeThinkingSupport(ctx, config.defaults.learningModel)}`,
+			);
+		}
 		persistModelConfig(runtime, config);
 		ctx.ui.notify(applied.notes.join("\n"), "info");
 		return;
@@ -545,7 +558,7 @@ function modelListing(ctx: ExtensionCommandContext, config: MemoryConfig): strin
 		`学习模型: ${config.defaults.learningModel}`,
 		`学习思考强度: ${config.defaults.learningThinkingLevel}${describeThinkingSupport(ctx, config.defaults.learningModel)}`,
 		"",
-		"交互模式下直接运行 /sm model 打开模型选择器，/sm model --thinking 选择思考强度；",
+		"交互模式下直接运行 /sm model 选择模型，随后选择思考强度；/sm model --thinking 只调整强度。",
 		"也支持显式输入: /sm model current | <provider/model-id> [--thinking <level>]。",
 		`可用强度: ${LEARNING_THINKING_LEVELS.join(" | ")}`,
 		"",
