@@ -126,10 +126,11 @@ function execute(
 	h: Harness,
 	toolName: string,
 	params: Record<string, unknown>,
+	ctx: Record<string, unknown> = {},
 ): Promise<{ text: string; details: Record<string, unknown> }> {
 	const tool = h.tools.get(toolName);
 	assert.ok(tool, `tool ${toolName} 未注册`);
-	return tool.execute("call-1", params, undefined, undefined, {}).then((result) => ({
+	return tool.execute("call-1", params, undefined, undefined, ctx).then((result) => ({
 		text: result.content.map((part) => part.text).join("\n"),
 		details: result.details,
 	}));
@@ -408,6 +409,51 @@ test("/sm model 修改后当前会话的学习调用立即生效", async () => {
 	});
 	await h.handlers.get("agent_settled")?.({ type: "agent_settled", aborted: false }, learnCtx);
 	assert.equal(captured, "high", "同一会话内 /sm model 的设置必须立即生效");
+	await h.shutdown();
+});
+
+test("UI 反馈：记忆工具调用时给出临时通知，不写页脚状态", async () => {
+	const { root, base } = enterpriseSetup();
+	const notices: string[] = [];
+	let footerWrites = 0;
+	const h = harness(notices);
+	const ctx = makeCtx(join(root, "backend"), notices, { hasUI: true });
+	const ui = (ctx as unknown as { ui: Record<string, unknown> }).ui;
+	ui.setStatus = () => {
+		footerWrites += 1;
+	};
+	await h.sessionStart(ctx);
+
+	const saved = await execute(
+		h,
+		"scope_memory_save",
+		{
+			action: "upsert",
+			kind: "fact",
+			title: "Backend 使用 HikariCP",
+			content: "Backend 连接池使用 HikariCP。",
+			evidence: [{ repo: "backend", path: "src/db.ts" }],
+		},
+		ctx as unknown as Record<string, unknown>,
+	);
+	assert.match(saved.text, /已创建/);
+	assert.ok(notices.some((notice) => notice.includes("记忆已创建: Backend 使用 HikariCP")));
+
+	await execute(
+		h,
+		"scope_memory_search",
+		{ query: "HikariCP" },
+		ctx as unknown as Record<string, unknown>,
+	);
+	assert.ok(notices.some((notice) => notice.includes("记忆检索: 1 条匹配")));
+	assert.equal(footerWrites, 0, "不应调用 setStatus 改写页脚");
+
+	await h.shutdown();
+	await h.sessionStart(
+		makeCtx(join(base, "unrelated"), notices, { hasUI: true, sessionId: "outside" }),
+	);
+	assert.deepEqual(h.activeTools(), []);
+	assert.equal(footerWrites, 0);
 	await h.shutdown();
 });
 

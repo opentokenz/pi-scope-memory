@@ -1,4 +1,4 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionToolContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { DEFAULT_DEFAULTS, type DefaultsConfig, type PromptConfig } from "./config.ts";
 import type { MemoryDb } from "./db.ts";
@@ -11,7 +11,7 @@ import {
 	type SaveMemoryResult,
 	type MemorySearchHit,
 } from "./memory.ts";
-import type { ResolvedScope } from "./scope.ts";
+import { displayName, type ResolvedScope } from "./scope.ts";
 import { recordRetrievalUsage } from "./stats.ts";
 
 export const MEMORY_TOOL_NAMES = ["scope_memory_search", "scope_memory_save"] as const;
@@ -133,7 +133,7 @@ export function registerMemoryTools(pi: ExtensionAPI, runtime: MemoryRuntime): v
 		parameters: searchParameters,
 		defaultActive: false,
 		annotations: { readOnlyHint: true, openWorldHint: false },
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const db = requireDb(runtime);
 			const scope = runtime.scope as ResolvedScope;
 			if (!params.query || params.query.trim() === "") {
@@ -153,6 +153,7 @@ export function registerMemoryTools(pi: ExtensionAPI, runtime: MemoryRuntime): v
 			);
 			const text = formatSearchResult(runtime, params.query, result.hits, result.candidates);
 			recordRetrievalUsage(db, runtime.sessionId, Math.ceil(text.length / 2.5));
+			notifyTool(ctx, `记忆检索: ${result.hits.length} 条匹配 · ${displayName(scope)}`);
 			return {
 				content: [{ type: "text" as const, text }],
 				details: {
@@ -180,7 +181,7 @@ export function registerMemoryTools(pi: ExtensionAPI, runtime: MemoryRuntime): v
 		parameters: saveParameters,
 		defaultActive: false,
 		annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
-		async execute(_toolCallId, params) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const db = requireDb(runtime);
 			const scope = runtime.scope as ResolvedScope;
 			if (params.action !== "invalidate") {
@@ -205,6 +206,7 @@ export function registerMemoryTools(pi: ExtensionAPI, runtime: MemoryRuntime): v
 				runtime.defaults.retrieval,
 			);
 			const text = formatSaveResult(runtime, result);
+			notifyTool(ctx, formatToolNotification(result));
 			return {
 				content: [{ type: "text" as const, text }],
 				details: {
@@ -231,6 +233,30 @@ export function deactivateMemoryTools(pi: ExtensionAPI): void {
 	const current = pi.getActiveTools();
 	const next = current.filter((name) => !MEMORY_TOOL_NAMES.includes(name as (typeof MEMORY_TOOL_NAMES)[number]));
 	if (next.length !== current.length) pi.setActiveTools(next);
+}
+
+function notifyTool(ctx: ExtensionToolContext, message: string): void {
+	if (!ctx.hasUI) return;
+	try {
+		ctx.ui.notify(message, "info");
+	} catch {
+		// UI is best-effort and must never break a tool result.
+	}
+}
+
+function formatToolNotification(result: SaveMemoryResult): string {
+	const label =
+		result.action === "created"
+			? "已创建"
+			: result.action === "updated"
+				? "已更新"
+				: result.action === "superseded"
+					? "已替代"
+					: result.action === "invalidated"
+						? "已失效"
+						: "已跳过";
+	const title = result.memory?.title ?? result.id ?? "";
+	return title === "" ? `记忆${label}` : `记忆${label}: ${title.length > 40 ? `${title.slice(0, 39)}…` : title}`;
 }
 
 function requireDb(runtime: MemoryRuntime): MemoryDb {

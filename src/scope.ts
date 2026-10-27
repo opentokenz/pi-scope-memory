@@ -222,7 +222,7 @@ export function isDirectory(input: string): boolean {
 
 export function displayName(scope: ResolvedScope): string {
 	const repo = repoRef(scope, scope.repoId);
-	return repo ? `${scope.scopeId} · ${repo.id}` : scope.scopeId;
+	return repo ? `${scope.scopeId}/${repo.id}` : scope.scopeId;
 }
 
 export function scopeLabel(scope: ResolvedScope): string {

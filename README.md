@@ -185,6 +185,8 @@ cd ~/Projects/enterprise
 
 ## Agent 工具
 
+Agent 调用这两个工具时，TUI 或 RPC 客户端会收到一条临时通知：检索显示命中数量与 Scope，保存显示创建、更新、替代、失效或跳过。通知不会写入页脚状态，也不会修改其他扩展的 UI。
+
 ### `scope_memory_search`
 
 ```ts
