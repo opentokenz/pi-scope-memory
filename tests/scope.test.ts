@@ -154,6 +154,34 @@ test("配置校验：非法仓库路径、重复 ID、错误版本都会失败",
 	assert.equal(explicit.defaults.learningThinkingLevel, "low");
 });
 
+test("全局提示词配置：学习系统提示词、补充要求与 recall 模板", () => {
+	const config = parseConfig({
+		version: 1,
+		prompts: {
+			learningSystem: "自定义提炼器规则",
+			learningGuidance: "优先记录认证相关约束",
+			recall: "请检索 {scope}/{repo}，主题: {topic}",
+		},
+		scopes: [],
+	});
+	assert.deepEqual(config.prompts, {
+		learningSystem: "自定义提炼器规则",
+		learningGuidance: "优先记录认证相关约束",
+		recall: "请检索 {scope}/{repo}，主题: {topic}",
+	});
+	assert.deepEqual(parseConfig({ version: 1, scopes: [] }).prompts, {});
+	assert.deepEqual(
+		parseConfig({ version: 1, prompts: { recall: "   " }, scopes: [] }).prompts,
+		{},
+		"空字符串表示使用默认提示词",
+	);
+	assert.throws(() => parseConfig({ version: 1, prompts: "bad", scopes: [] }), /prompts 必须是对象/);
+	assert.throws(
+		() => parseConfig({ version: 1, prompts: { learningSystem: 42 }, scopes: [] }),
+		/必须是字符串/,
+	);
+});
+
 test("配置写入后可读，默认关闭且 dynamicInjection 永远为 false", () => {
 	const root = tempRoot();
 	const { configPath } = useIsolatedHome(root);

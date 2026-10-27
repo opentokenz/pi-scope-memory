@@ -143,7 +143,11 @@ cd ~/Projects/enterprise
 /sm model anthropic/claude-sonnet-4-5
 /sm model --thinking high
 /sm model anthropic/claude-sonnet-4-5 --thinking low
+/sm model anthropic/claude-sonnet-4-5 high
+/sm model current off
 ```
+
+非交互模式可以直接用位置参数：`/sm model <model> <level>`。位置参数与 `--thinking` 等价；两者同时出现且值不一致会报错。
 
 ## 目录 Scope 模型
 
@@ -257,6 +261,7 @@ cd ~/Projects/enterprise
       "trackUsage": true
     }
   },
+  "prompts": {},
   "scopes": [
     {
       "id": "enterprise",
@@ -283,6 +288,25 @@ cd ~/Projects/enterprise
 - `cache.dynamicInjection` 即使写成 `true` 也会被强制为 `false`，避免手改配置破坏缓存。
 - 配置校验失败、文件缺失、Scope 未启用、路径不在允许目录时一律不启用；配置无效时会给出一次告警。
 - 测试或隔离环境可用 `PI_SCOPE_MEMORY_CONFIG` 和 `PI_SCOPE_MEMORY_DATA_DIR` 覆盖路径。
+
+### 全局提示词
+
+`prompts` 是全局配置，对所有 Scope 生效。修改提示词后需要 `/reload` 或新会话。
+
+```json
+{
+  "prompts": {
+    "learningSystem": "你是团队的项目记忆提炼器……",
+    "learningGuidance": "优先记录认证、支付相关的跨仓库约束。",
+    "recall": "请先调用 scope_memory_search 检索 {scope}/{repo} 的历史记忆。\n可用仓库: {repos}\n检索主题: {topic}"
+  }
+}
+```
+
+- `learningSystem`：完整替换内置学习系统提示词。插件仍会在末尾追加 JSON 输出格式要求，保证学习结果可解析。
+- `learningGuidance`：追加到学习提示词中的额外要求，适合小范围调整，不必复制整段系统提示词。
+- `recall`：`/sm recall` 发送的用户消息模板。支持 `{scope}`、`{repo}`、`{repos}`、`{topic}` 四个占位符。模板缺少 `{topic}` 但用户输入了主题时，插件会在消息末尾追加「检索主题: …」；未提供主题时，`{topic}` 会替换为默认的推断语句。
+- 空字符串表示使用内置默认值。提示词只影响学习与召回文本，不会改变工具声明或系统提示词的固定前缀。
 
 ## 学习模型与思考强度
 

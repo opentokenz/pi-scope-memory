@@ -1,6 +1,6 @@
 import type { Api, AssistantMessage, Model, ThinkingLevel, UserMessage } from "@earendil-works/pi-ai";
 import type { ExtensionContext, ToolResultEvent } from "@earendil-works/pi-coding-agent";
-import type { DefaultsConfig, LearningThinkingLevel } from "./config.ts";
+import type { DefaultsConfig, LearningThinkingLevel, PromptConfig } from "./config.ts";
 import { getMeta, nowIso, setMeta, type MemoryDb } from "./db.ts";
 import {
 	MEMORY_KINDS,
@@ -27,6 +27,7 @@ export interface LearningDeps {
 	db: MemoryDb;
 	scope: ResolvedScope;
 	defaults: DefaultsConfig;
+	prompts: PromptConfig;
 	sessionId: string;
 }
 
@@ -166,8 +167,9 @@ export async function runLearningBatch(
 		}
 
 		const prompt = buildPrompt(deps, pending);
+		const systemPrompt = buildLearningSystemPrompt(deps.prompts);
 		const reasoning = resolveReasoning(piModelContext, deps.defaults.learningThinkingLevel);
-		const response = await requestCandidates(piModelContext, resolved.model, prompt, reasoning);
+		const response = await requestCandidates(piModelContext, resolved.model, systemPrompt, prompt, reasoning);
 		const usage = response.usage;
 		recordLearningUsage(
 			deps.db,
@@ -295,6 +297,7 @@ function resolveReasoning(
 async function requestCandidates(
 	ctx: ExtensionContext,
 	model: Model<Api>,
+	systemPrompt: string,
 	prompt: string,
 	reasoning: ThinkingLevel | undefined,
 ): Promise<AssistantMessage> {
@@ -313,7 +316,7 @@ async function requestCandidates(
 		return await ctx.modelRegistry
 			.streamSimple(
 				model,
-				{ systemPrompt: LEARNING_SYSTEM_PROMPT, messages: [message] },
+				{ systemPrompt, messages: [message] },
 				{ signal: controller.signal, maxTokens: 2000, reasoning },
 			)
 			.result();
@@ -333,10 +336,11 @@ const LEARNING_SYSTEM_PROMPT = `你是 pi-scope-memory 的工程知识提炼器�
 - 证据必须来自事件中真实出现过的文件路径，并且只写到文件或目录级别。
 - 没有可靠证据时 evidence 留空，系统会把它保存为未验证候选。
 - 旧结论已被新事实取代时，用 replaces 指向已有记忆的 id。
-- 宁可少记录：最多 5 条；没有值得长期保存的内容就输出 []。
-- 只输出 JSON 数组，不要 Markdown 代码块或解释文字。
+- 宁可少记录：最多 5 条；没有值得长期保存的内容就输出 []。`;
 
-每个元素字段:
+const LEARNING_OUTPUT_SPEC = `输出格式（必须遵守）:
+- 只输出 JSON 数组，不要 Markdown 代码块或解释文字。
+- 每个元素字段:
 {
   "kind": "fact|decision|constraint|pitfall|preference|checkpoint",
   "title": "不超过 100 字的标题",
@@ -348,9 +352,21 @@ const LEARNING_SYSTEM_PROMPT = `你是 pi-scope-memory 的工程知识提炼器�
   "replaces": "可选，被替代的记忆 id"
 }`;
 
+function buildLearningSystemPrompt(prompts: PromptConfig): string {
+	const custom = prompts.learningSystem?.trim();
+	const base = custom && custom !== "" ? custom : LEARNING_SYSTEM_PROMPT;
+	const parts = [base];
+	const guidance = prompts.learningGuidance?.trim();
+	if (guidance) parts.push(`补充要求:\n${guidance}`);
+	// Always append the wire format so both the built-in and custom prompts
+	// produce output the parser can consume.
+	parts.push(LEARNING_OUTPUT_SPEC);
+	return parts.join("\n\n");
+}
+
 function buildPrompt(deps: LearningDeps, pending: PendingObservation[]): string {
 	const { scope } = deps;
-	const repoIds = scope.repos.map((repo) => repo.id);
+	const repoIds = scope.repos.map((repo) => repo.id).sort((a, b) => a.localeCompare(b));
 	const titles = listRecentTitles(deps.db, scope, 25);
 	const lines: string[] = [];
 	lines.push(`Scope: ${scope.scopeId}`);

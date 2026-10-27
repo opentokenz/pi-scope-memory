@@ -1,6 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { DEFAULT_DEFAULTS, type DefaultsConfig } from "./config.ts";
+import { DEFAULT_DEFAULTS, type DefaultsConfig, type PromptConfig } from "./config.ts";
 import type { MemoryDb } from "./db.ts";
 import {
 	MemoryError,
@@ -21,6 +21,7 @@ export interface MemoryRuntime {
 	scope?: ResolvedScope;
 	db?: MemoryDb;
 	defaults: DefaultsConfig;
+	prompts: PromptConfig;
 	sessionId: string;
 	lastLearnedAt?: string;
 }
@@ -29,6 +30,7 @@ export function createMemoryRuntime(): MemoryRuntime {
 	return {
 		active: false,
 		defaults: structuredClone(DEFAULT_DEFAULTS),
+		prompts: {},
 		sessionId: "unknown",
 	};
 }

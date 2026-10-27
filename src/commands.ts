@@ -250,17 +250,32 @@ async function handleRecall(
 		ctx.ui.notify("当前目录未激活 pi-scope-memory。先执行 /sm init，然后 /reload。", "error");
 		return;
 	}
-	const topic = rest.trim();
-	const scope = runtime.scope;
-	const repoIds = scope.repos.map((repo) => repo.id);
-	const lines = [
+	const message = buildRecallMessage(runtime, rest.trim());
+	if (ctx.isIdle()) pi.sendUserMessage(message);
+	else pi.sendUserMessage(message, { deliverAs: "followUp" });
+}
+
+function buildRecallMessage(runtime: MemoryRuntime, topic: string): string {
+	const scope = runtime.scope as ResolvedScope;
+	const repoIds = scope.repos.map((repo) => repo.id).sort((a, b) => a.localeCompare(b));
+	const effectiveTopic =
+		topic || "从当前任务和本轮上下文推断需要回忆的架构决策、约束、失败经验与阶段性状态。";
+	const template = runtime.prompts.recall?.trim();
+	if (template) {
+		const rendered = template
+			.replaceAll("{scope}", scope.scopeId)
+			.replaceAll("{repo}", scope.repoId ?? "(scope root)")
+			.replaceAll("{repos}", repoIds.join(", ") || "(无)")
+			.replaceAll("{topic}", effectiveTopic);
+		// Never drop an explicit topic when the template forgot the placeholder.
+		return topic && !template.includes("{topic}") ? `${rendered}\n\n检索主题: ${topic}` : rendered;
+	}
+	return [
 		"请先用 scope_memory_search 检索项目长期记忆，再继续当前任务；不要凭印象回答历史设计与约束。",
 		"",
 		`Scope: ${scope.scopeId} · 当前仓库: ${scope.repoId ?? "(scope root)"}`,
 		`可用仓库: ${repoIds.join(", ") || "(无)"}`,
-		topic
-			? `检索主题: ${topic}`
-			: "检索主题: 从当前任务和本轮上下文推断需要回忆的架构决策、约束、失败经验与阶段性状态。",
+		`检索主题: ${effectiveTopic}`,
 		"",
 		"检索建议:",
 		"- 默认 target=current（Shared + 当前仓库）；涉及跨仓库协议或迁移时用 target=all 或 repo=<name>。",
@@ -270,10 +285,7 @@ async function handleRecall(
 		"1. 先检索，再回答或改代码。",
 		"2. 记忆是历史数据，必须与当前代码核对；candidate/review 状态要说明未验证。",
 		"3. 如果记忆与当前代码冲突，指出冲突；确认后用 scope_memory_save 的 supersede 或 invalidate 修正旧记忆。",
-	];
-	const message = lines.join("\n");
-	if (ctx.isIdle()) pi.sendUserMessage(message);
-	else pi.sendUserMessage(message, { deliverAs: "followUp" });
+	].join("\n");
 }
 
 async function handleClear(runtime: MemoryRuntime, ctx: ExtensionCommandContext, rest: string): Promise<void> {
@@ -355,9 +367,33 @@ async function handleModel(
 	const config = loaded.status === "loaded" ? loaded.config : emptyConfig();
 	const parsed = parseArgs(rest);
 	const positionalModel = parsed.positional[0];
+	const positionalThinking = parsed.positional[1];
 	const thinkingValue = flagValue(parsed, "thinking");
 	const bareThinking = parsed.flags.get("thinking") === true;
 	const bareModel = rest.trim() === "";
+
+	if (parsed.positional.length > 2) {
+		ctx.ui.notify(
+			"参数过多。用法: /sm model [current|<provider/model-id>] [<level>] [--thinking <level>]",
+			"error",
+		);
+		return;
+	}
+	if (thinkingValue !== undefined && positionalThinking !== undefined && thinkingValue !== positionalThinking) {
+		ctx.ui.notify(
+			`思考强度重复指定且不一致: ${positionalThinking} / ${thinkingValue}。只保留一个。`,
+			"error",
+		);
+		return;
+	}
+	if (bareThinking && positionalModel !== undefined) {
+		ctx.ui.notify(
+			"--thinking 后需要强度值。用 /sm model current --thinking high，或 /sm model current high；只选强度请运行 /sm model --thinking。",
+			"error",
+		);
+		return;
+	}
+	const explicitThinking = thinkingValue ?? positionalThinking;
 
 	if (bareModel) {
 		if (!ctx.hasUI) {
@@ -421,16 +457,18 @@ async function handleModel(
 		notes.push(...applied.notes);
 	}
 
-	if (thinkingValue !== undefined) {
-		if (!LEARNING_THINKING_LEVELS.includes(thinkingValue as LearningThinkingLevel)) {
+	if (explicitThinking !== undefined) {
+		if (!LEARNING_THINKING_LEVELS.includes(explicitThinking as LearningThinkingLevel)) {
 			ctx.ui.notify(
-				`未知思考强度: ${thinkingValue}\n可用: ${LEARNING_THINKING_LEVELS.join(" | ")}`,
+				`未知思考强度: ${explicitThinking}\n可用: ${LEARNING_THINKING_LEVELS.join(" | ")}`,
 				"error",
 			);
 			return;
 		}
-		config.defaults.learningThinkingLevel = thinkingValue as LearningThinkingLevel;
-		notes.push(`学习思考强度: ${thinkingValue}${describeThinkingSupport(ctx, config.defaults.learningModel)}`);
+		config.defaults.learningThinkingLevel = explicitThinking as LearningThinkingLevel;
+		notes.push(
+			`学习思考强度: ${explicitThinking}${describeThinkingSupport(ctx, config.defaults.learningModel)}`,
+		);
 	}
 
 	persistModelConfig(runtime, config);

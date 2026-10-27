@@ -62,6 +62,7 @@ export default function scopeMemoryExtension(pi: ExtensionAPI): void {
 				db: runtime.db,
 				scope: runtime.scope,
 				defaults: runtime.defaults,
+				prompts: runtime.prompts,
 				sessionId: runtime.sessionId,
 			});
 			if (outcome.status === "ok") {
@@ -99,17 +100,20 @@ async function startSession(pi: ExtensionAPI, runtime: MemoryRuntime, ctx: Exten
 	const loaded = loadConfig();
 	if (loaded.status === "missing") {
 		runtime.defaults = structuredClone(DEFAULT_DEFAULTS);
+		runtime.prompts = {};
 		deactivateMemoryTools(pi);
 		return;
 	}
 	if (loaded.status === "invalid") {
 		runtime.defaults = structuredClone(DEFAULT_DEFAULTS);
+		runtime.prompts = {};
 		deactivateMemoryTools(pi);
 		reportQuietly(ctx, `配置无效，记忆未启用: ${loaded.error}`);
 		return;
 	}
 
 	runtime.defaults = loaded.config.defaults;
+	runtime.prompts = loaded.config.prompts;
 	const resolution = resolveScope(loaded.config, ctx.cwd);
 	if (!resolution.active) {
 		// Staying silent here is intentional: directories outside a configured

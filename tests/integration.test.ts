@@ -284,6 +284,22 @@ test("/sm model 查看、切换与校验", async () => {
 		assert.equal(both.config.defaults.learningThinkingLevel, "low");
 	}
 
+	// 非交互模式的位置参数: /sm model <model> <level>
+	await command.handler("model openai/gpt-x max", ctx as unknown as ExtensionCommandContext);
+	const positional = loadConfig();
+	if (positional.status === "loaded") {
+		assert.equal(positional.config.defaults.learningModel, "openai/gpt-x");
+		assert.equal(positional.config.defaults.learningThinkingLevel, "max");
+	}
+	await command.handler("model openai/gpt-x turbo", ctx as unknown as ExtensionCommandContext);
+	assert.ok(notices.some((notice) => notice.includes("未知思考强度: turbo")));
+	await command.handler("model openai/gpt-x low high", ctx as unknown as ExtensionCommandContext);
+	assert.ok(notices.some((notice) => notice.includes("参数过多")));
+	await command.handler("model openai/gpt-x low --thinking high", ctx as unknown as ExtensionCommandContext);
+	assert.ok(notices.some((notice) => notice.includes("重复指定")));
+	await command.handler("model openai/gpt-x --thinking", ctx as unknown as ExtensionCommandContext);
+	assert.ok(notices.some((notice) => notice.includes("--thinking 后需要强度值")));
+
 	await command.handler("model current", ctx as unknown as ExtensionCommandContext);
 	const reset = loadConfig();
 	if (reset.status === "loaded") assert.equal(reset.config.defaults.learningModel, "current");
@@ -504,6 +520,57 @@ test("/sm init 拒绝重叠 Scope", async () => {
 	assert.ok(notices.some((notice) => notice.includes("已属于 Scope") || notice.includes("重叠")));
 	const loaded = loadConfig(configPath);
 	if (loaded.status === "loaded") assert.equal(loaded.config.scopes.length, 1);
+	await h.shutdown();
+});
+
+test("/sm recall 支持全局配置的提示词模板", async () => {
+	const { root } = enterpriseSetup();
+	const loaded = loadConfig();
+	assert.equal(loaded.status, "loaded");
+	if (loaded.status !== "loaded") return;
+	loaded.config.prompts = {
+		recall: "请检索 {scope}/{repo}，仓库: {repos}。主题: {topic}。先调用 scope_memory_search。",
+	};
+	writeConfig(loaded.config);
+
+	const notices: string[] = [];
+	const sent: string[] = [];
+	const h = harness(notices, sent);
+	await h.sessionStart(makeCtx(join(root, "backend"), notices));
+	await h.commands.get("sm")?.handler(
+		"recall 认证为什么放弃 Session",
+		makeCtx(root, notices) as unknown as ExtensionCommandContext,
+	);
+	assert.equal(
+		sent[0],
+		"请检索 enterprise/backend，仓库: backend, frontend, sdk。主题: 认证为什么放弃 Session。先调用 scope_memory_search。",
+	);
+
+	// 模板缺少 {topic} 时，用户显式主题仍必须附加到消息末尾。
+	const second = loadConfig();
+	if (second.status === "loaded") {
+		second.config.prompts = { recall: "请检索 {scope} 并调用 scope_memory_search" };
+		writeConfig(second.config);
+	}
+	await h.sessionStart(makeCtx(join(root, "backend"), notices, { sessionId: "recall-2" }));
+	await h.commands.get("sm")?.handler(
+		"recall 支付回调",
+		makeCtx(root, notices) as unknown as ExtensionCommandContext,
+	);
+	assert.equal(sent[1], "请检索 enterprise 并调用 scope_memory_search\n\n检索主题: 支付回调");
+
+	// 未提供主题时，{topic} 替换为默认的推断语句。
+	const third = loadConfig();
+	if (third.status === "loaded") {
+		third.config.prompts = { recall: "先调用 scope_memory_search，主题: {topic}" };
+		writeConfig(third.config);
+	}
+	await h.sessionStart(makeCtx(join(root, "backend"), notices, { sessionId: "recall-3" }));
+	await h.commands.get("sm")?.handler(
+		"recall",
+		makeCtx(root, notices) as unknown as ExtensionCommandContext,
+	);
+	assert.match(sent[2] ?? "", /从当前任务和本轮上下文推断/);
 	await h.shutdown();
 });
 

@@ -53,6 +53,7 @@ function toolResult(overrides: Partial<ToolResultEvent> & { toolName: string }):
 
 interface CapturedRequest {
 	reasoning?: unknown;
+	systemPrompt?: string;
 }
 
 function fakeContext(
@@ -65,8 +66,9 @@ function fakeContext(
 		model: { provider: "anthropic", id: "test-model", reasoning: true },
 		thinkingLevel,
 		modelRegistry: {
-			streamSimple: (_model: unknown, _context: unknown, options?: { reasoning?: unknown }) => {
+			streamSimple: (_model: unknown, context: { systemPrompt?: string }, options?: { reasoning?: unknown }) => {
 				captured.reasoning = options?.reasoning;
+				captured.systemPrompt = context.systemPrompt;
 				return { result: respond };
 			},
 			find: (provider: string, id: string) => ({ provider, id, reasoning: true }),
@@ -188,6 +190,7 @@ test("学习思考强度：inherit 跟随会话，off 不发送 reasoning", asyn
 			db: fx.db,
 			scope: fx.scope,
 			defaults: { ...fx.config.defaults, learningThinkingLevel: "inherit" },
+			prompts: {},
 			sessionId: "s",
 		});
 		assert.equal(withHigh.status, "ok");
@@ -203,6 +206,7 @@ test("学习思考强度：inherit 跟随会话，off 不发送 reasoning", asyn
 			db: fx.db,
 			scope: fx.scope,
 			defaults: { ...fx.config.defaults, learningThinkingLevel: "off" },
+			prompts: {},
 			sessionId: "s",
 		});
 		assert.equal(off.reasoning, undefined);
@@ -217,9 +221,54 @@ test("学习思考强度：inherit 跟随会话，off 不发送 reasoning", asyn
 			db: fx.db,
 			scope: fx.scope,
 			defaults: { ...fx.config.defaults, learningThinkingLevel: "low" },
+			prompts: {},
 			sessionId: "s",
 		});
 		assert.equal(fixed.reasoning, "low");
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+test("学习提示词可在全局配置中定制，并始终追加 JSON 输出契约", async () => {
+	const fx = fixture();
+	try {
+		captureToolResult(
+			fx.db,
+			"s",
+			toolResult({ toolName: "write", toolCallId: "p1", input: { path: "src/a.ts" } }),
+		);
+		const custom: CapturedRequest = {};
+		const customOutcome = await runLearningBatch(fakeContext("[]", custom), {
+			db: fx.db,
+			scope: fx.scope,
+			defaults: fx.config.defaults,
+			prompts: {
+				learningSystem: "自定义提炼器规则",
+				learningGuidance: "优先记录认证相关约束",
+			},
+			sessionId: "s",
+		});
+		assert.equal(customOutcome.status, "ok");
+		assert.match(custom.systemPrompt ?? "", /^自定义提炼器规则/);
+		assert.match(custom.systemPrompt ?? "", /优先记录认证相关约束/);
+		assert.match(custom.systemPrompt ?? "", /只输出 JSON 数组/);
+
+		captureToolResult(
+			fx.db,
+			"s",
+			toolResult({ toolName: "write", toolCallId: "p2", input: { path: "src/b.ts" } }),
+		);
+		const builtIn: CapturedRequest = {};
+		await runLearningBatch(fakeContext("[]", builtIn), {
+			db: fx.db,
+			scope: fx.scope,
+			defaults: fx.config.defaults,
+			prompts: {},
+			sessionId: "s",
+		});
+		assert.match(builtIn.systemPrompt ?? "", /工程知识提炼器/);
+		assert.match(builtIn.systemPrompt ?? "", /只输出 JSON 数组/);
 	} finally {
 		closeMemoryDb(fx.db);
 	}
@@ -289,6 +338,7 @@ test("学习批次写入记忆、记录用量并清空待处理事件", async ()
 			db: fx.db,
 			scope: fx.scope,
 			defaults: fx.config.defaults,
+			prompts: {},
 			sessionId: "s",
 		});
 		assert.equal(outcome.status, "ok");
@@ -329,6 +379,7 @@ test("预算耗尽时暂停学习并保留事件；0 表示不限额", async () 
 			db: fx.db,
 			scope: fx.scope,
 			defaults: { ...fx.config.defaults, learningTokenBudgetPerDay: 100 },
+			prompts: {},
 			sessionId: "s",
 		});
 		assert.equal(budgeted.status, "skipped");
@@ -340,6 +391,7 @@ test("预算耗尽时暂停学习并保留事件；0 表示不限额", async () 
 			db: fx.db,
 			scope: fx.scope,
 			defaults: { ...fx.config.defaults, learningTokenBudgetPerDay: 0 },
+			prompts: {},
 			sessionId: "s",
 		});
 		assert.equal(unlimited.status, "ok");
@@ -366,6 +418,7 @@ test("模型不可用时保留事件并记录错误", async () => {
 			db: fx.db,
 			scope: fx.scope,
 			defaults: { ...fx.config.defaults, learningTokenBudgetPerDay: 100_000 },
+			prompts: {},
 			sessionId: "s",
 		});
 		assert.equal(outcome.status, "error");
@@ -391,7 +444,8 @@ test("非法 JSON 触发有限重试而不是无限循环", async () => {
 				db: fx.db,
 				scope: fx.scope,
 				defaults: fx.config.defaults,
-				sessionId: "s",
+				prompts: {},
+			sessionId: "s",
 			});
 			assert.equal(outcome.status, "error");
 		}

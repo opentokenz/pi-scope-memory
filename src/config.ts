@@ -50,9 +50,19 @@ export interface ScopeConfig {
 	allowedDirectories?: string[];
 }
 
+export interface PromptConfig {
+	/** Full replacement for the built-in learner system prompt. */
+	learningSystem?: string;
+	/** Extra rules appended to the learner prompt. */
+	learningGuidance?: string;
+	/** Template for the /sm recall user message. */
+	recall?: string;
+}
+
 export interface MemoryConfig {
 	version: number;
 	defaults: DefaultsConfig;
+	prompts: PromptConfig;
 	scopes: ScopeConfig[];
 }
 
@@ -128,6 +138,7 @@ export function emptyConfig(): MemoryConfig {
 	return {
 		version: CONFIG_VERSION,
 		defaults: structuredClone(DEFAULT_DEFAULTS),
+		prompts: {},
 		scopes: [],
 	};
 }
@@ -165,6 +176,7 @@ export function parseConfig(value: unknown): MemoryConfig {
 	}
 
 	const defaults = parseDefaults(value.defaults);
+	const prompts = parsePrompts(value.prompts);
 	const scopesRaw = value.scopes === undefined ? [] : value.scopes;
 	if (!Array.isArray(scopesRaw)) throw new ConfigError("scopes 必须是数组");
 
@@ -196,7 +208,7 @@ export function parseConfig(value: unknown): MemoryConfig {
 		scopes.push(scope);
 	}
 
-	return { version: CONFIG_VERSION, defaults, scopes };
+	return { version: CONFIG_VERSION, defaults, prompts, scopes };
 }
 
 function parseDefaults(value: unknown): DefaultsConfig {
@@ -263,6 +275,25 @@ function parseDefaults(value: unknown): DefaultsConfig {
 	}
 
 	return defaults;
+}
+
+const MAX_PROMPT_CHARS = 20_000;
+
+function parsePrompts(value: unknown): PromptConfig {
+	if (value === undefined) return {};
+	if (!isRecord(value)) throw new ConfigError("prompts 必须是对象");
+	const prompts: PromptConfig = {};
+	for (const key of ["learningSystem", "learningGuidance", "recall"] as const) {
+		const raw = value[key];
+		if (raw === undefined) continue;
+		if (typeof raw !== "string") throw new ConfigError(`prompts.${key} 必须是字符串`);
+		if (raw.length > MAX_PROMPT_CHARS) {
+			throw new ConfigError(`prompts.${key} 超过 ${MAX_PROMPT_CHARS} 字符上限`);
+		}
+		// Preserve the author's formatting; empty strings simply mean "use the default".
+		if (raw.trim() !== "") prompts[key] = raw;
+	}
+	return prompts;
 }
 
 function parseScope(value: unknown, index: number, defaultEnabled: boolean): ScopeConfig {
