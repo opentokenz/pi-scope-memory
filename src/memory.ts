@@ -956,24 +956,23 @@ function validateEvidence(
 			notes.push(`证据引用了未注册仓库 ${repo}，已忽略: ${path}`);
 			continue;
 		}
-		const abs = repoAbsolutePath(scope, repo, path);
-		if (!abs) {
+		const resolved = resolveEvidencePath(scope, repo, path);
+		if (!resolved) {
 			notes.push(`证据路径逃逸出仓库，已忽略: ${path}`);
 			continue;
 		}
-		const hash = hashPath(abs);
-		const verified = hash !== undefined;
+		const verified = resolved.hash !== undefined;
 		if (!verified) notes.push(`证据文件不存在: ${repo}/${path}`);
 		if (verified) verifiedCount += 1;
 		items.push({
 			repo,
-			path,
+			path: resolved.rel,
 			commit: raw.commit,
 			branch: raw.branch,
 			reason: raw.reason,
 			verified,
 			verifiedAt: now,
-			hash,
+			hash: resolved.hash,
 		});
 	}
 
@@ -1233,6 +1232,37 @@ function isSensitivePath(path: string): boolean {
 		base.includes("credentials") ||
 		base.includes("secret")
 	);
+}
+
+/**
+ * Resolve evidence to a file inside its repository. Models sometimes prefix the
+ * path with the repository id or the repository's scope-relative directory, which
+ * repeats a segment that is not part of the repo path; taken literally it fails
+ * verification and downgrades an otherwise correct memory to a candidate. A path
+ * that exists as written always wins over the shortened variants.
+ */
+function resolveEvidencePath(
+	scope: ResolvedScope,
+	repoId: string,
+	path: string,
+): { rel: string; abs: string; hash?: string } | undefined {
+	const repo = repoRef(scope, repoId);
+	if (!repo) return undefined;
+	const prefixes = new Set([repoId, repo.rel.replaceAll("\\", "/")]);
+	const variants = [path];
+	for (const prefix of prefixes) {
+		if (prefix === "" || prefix === ".") continue;
+		if (path.startsWith(`${prefix}/`)) variants.push(path.slice(prefix.length + 1));
+	}
+	let missing: { rel: string; abs: string } | undefined;
+	for (const variant of new Set(variants)) {
+		const abs = repoAbsolutePath(scope, repoId, variant);
+		if (!abs) continue;
+		const hash = hashPath(abs);
+		if (hash !== undefined) return { rel: variant, abs, hash };
+		missing ??= { rel: variant, abs };
+	}
+	return missing;
 }
 
 function hashPath(path: string): string | undefined {

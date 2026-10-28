@@ -212,6 +212,35 @@ test("显式 supersede 与 invalidate", () => {
 	}
 });
 
+test("证据路径误带仓库前缀时按仓库根目录校正", () => {
+	const fx = fixture();
+	try {
+		// Learning writes the scope-relative path, so the repository id shows up
+		// twice. That must still verify instead of dropping to candidate.
+		const prefixed = save(fx, fx.backend, {
+			kind: "fact",
+			title: "数据访问层使用 HikariCP",
+			content: "后端数据访问层统一使用 HikariCP。",
+			evidence: [{ repo: "backend", path: "backend/src/db.ts" }],
+		});
+		assert.equal(prefixed.status, "active");
+		assert.equal(prefixed.memory?.evidence[0]?.path, "src/db.ts", "证据路径应归一化为仓库相对路径");
+
+		// A real subdirectory that happens to share the repo id wins as written.
+		writeFile(join(fx.root, "backend"), "backend/actual.ts", "export const nested = true;\n");
+		const nested = save(fx, fx.backend, {
+			kind: "fact",
+			title: "嵌套同名目录",
+			content: "backend 仓库下存在一个也叫 backend 的子目录。",
+			evidence: [{ repo: "backend", path: "backend/actual.ts" }],
+		});
+		assert.equal(nested.status, "active");
+		assert.equal(nested.memory?.evidence[0]?.path, "backend/actual.ts", "真实存在的原路径必须优先");
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
 test("证据验证：实现事实有证据才 active，无证据是 candidate", () => {
 	const fx = fixture();
 	try {
