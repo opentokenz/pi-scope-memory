@@ -46,6 +46,13 @@ const MAX_BATCH = 40;
 const MAX_CANDIDATES = 5;
 const MAX_SUMMARY_CHARS = 7000;
 const MODEL_TIMEOUT_MS = 120_000;
+/**
+ * 5 candidates of ≤400 chars of Chinese content plus titles, tags and evidence
+ * already need roughly 3–4k tokens; reasoning effort at "medium" or above draws
+ * from the same budget. A 2000-token cap truncated the JSON array mid-object and
+ * every such pass was reported as "invalid json" after burning its tokens.
+ */
+const MODEL_MAX_OUTPUT_TOKENS = 8000;
 
 let learningInFlight = false;
 
@@ -185,6 +192,9 @@ export async function runLearningBatch(
 			resolved.model.id,
 		);
 		const tokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+		// Providers that ignore the token cap report nothing; treat a response that
+		// consumed the whole budget as truncated rather than as malformed output.
+		const truncated = response.stopReason === "length" || usage.output >= MODEL_MAX_OUTPUT_TOKENS;
 
 		if (response.stopReason === "error" || response.stopReason === "aborted") {
 			setMeta(deps.db, "last_learning_error", response.errorMessage ?? `学习模型调用失败 (${response.stopReason})`);
@@ -195,6 +205,10 @@ export async function runLearningBatch(
 		const candidates = extractCandidates(text);
 		if (!candidates) {
 			bumpAttempts(deps.db, pending.map((item) => item.id));
+			if (truncated) {
+				setMeta(deps.db, "last_learning_error", "学习模型输出被截断且没有完整候选，本轮丢弃并有限重试");
+				return { status: "error", reason: "模型输出被截断，没有完整候选", ...empty, tokens };
+			}
 			setMeta(deps.db, "last_learning_error", "学习模型输出不是合法 JSON 数组，本轮丢弃并有限重试");
 			return { status: "error", reason: "invalid json", ...empty, tokens };
 		}
@@ -240,6 +254,7 @@ export async function runLearningBatch(
 
 		return {
 			status: "ok",
+			reason: truncated ? `输出被截断，仅保存了 ${created + updated + superseded} 条完整候选` : undefined,
 			processed: pending.length,
 			created,
 			updated,
@@ -317,7 +332,7 @@ async function requestCandidates(
 			.streamSimple(
 				model,
 				{ systemPrompt, messages: [message] },
-				{ signal: controller.signal, maxTokens: 2000, reasoning },
+				{ signal: controller.signal, maxTokens: MODEL_MAX_OUTPUT_TOKENS, reasoning },
 			)
 			.result();
 	} finally {
@@ -475,18 +490,95 @@ interface CandidateInput {
 	replaces?: string;
 }
 
-/** Tolerant JSON extraction: models sometimes wrap the array in prose or fences. */
+/**
+ * Tolerant JSON extraction. Models wrap the array in prose or fences, and a
+ * response cut off at the token cap leaves the array unclosed. Scan for the
+ * first bracket offset that yields a usable array, then fall back to closing a
+ * truncated array at its last complete element.
+ */
 export function extractCandidates(text: string): CandidateInput[] | undefined {
-	const start = text.indexOf("[");
-	const end = text.lastIndexOf("]");
-	if (start < 0 || end <= start) return undefined;
+	let empty: CandidateInput[] | undefined;
+	for (let start = text.indexOf("["), seen = 0; start >= 0 && seen < 32; start = text.indexOf("[", start + 1), seen += 1) {
+		const slice = text.slice(start);
+		const balanced = parseCandidateArray(slice);
+		if (balanced) {
+			if (balanced.length > 0) return balanced;
+			empty ??= balanced;
+			continue;
+		}
+		const repaired = closeTruncatedArray(slice);
+		if (!repaired) continue;
+		const salvaged = parseCandidateArray(repaired);
+		if (salvaged && salvaged.length > 0) return salvaged;
+	}
+	return empty;
+}
+
+/** Parse the outermost JSON array that starts at `text[0]`. */
+function parseCandidateArray(text: string): CandidateInput[] | undefined {
+	const end = findArrayEnd(text);
+	if (end < 0) return undefined;
 	let parsed: unknown;
 	try {
-		parsed = JSON.parse(text.slice(start, end + 1));
+		parsed = JSON.parse(text.slice(0, end + 1));
 	} catch {
 		return undefined;
 	}
-	if (!Array.isArray(parsed)) return undefined;
+	return Array.isArray(parsed) ? normalizeCandidates(parsed) : undefined;
+}
+
+/** Index of the `]` that closes the array opening `text[0]`, ignoring strings. */
+function findArrayEnd(text: string): number {
+	let depth = 0;
+	let inString = false;
+	let escaped = false;
+	for (let index = 0; index < text.length; index += 1) {
+		const char = text[index];
+		if (inString) {
+			if (escaped) escaped = false;
+			else if (char === "\\") escaped = true;
+			else if (char === '"') inString = false;
+			continue;
+		}
+		if (char === '"') inString = true;
+		else if (char === "[") depth += 1;
+		else if (char === "]") {
+			depth -= 1;
+			if (depth === 0) return index;
+		}
+	}
+	return -1;
+}
+
+/**
+ * Rebuild a truncated array by cutting back to its last complete element, so a
+ * response that ran out of output tokens keeps the candidates it did finish.
+ */
+function closeTruncatedArray(text: string): string | undefined {
+	let depth = 0;
+	let inString = false;
+	let escaped = false;
+	let lastComplete = -1;
+	for (let index = 0; index < text.length; index += 1) {
+		const char = text[index];
+		if (inString) {
+			if (escaped) escaped = false;
+			else if (char === "\\") escaped = true;
+			else if (char === '"') inString = false;
+			continue;
+		}
+		if (char === '"') inString = true;
+		else if (char === "[" || char === "{") depth += 1;
+		else if (char === "]" || char === "}") {
+			depth -= 1;
+			if (depth === 1 && char === "}") lastComplete = index;
+		}
+	}
+	if (lastComplete < 0) return undefined;
+	return `${text.slice(0, lastComplete + 1)}]`;
+}
+
+function normalizeCandidates(parsed: unknown[]): CandidateInput[] {
 	const out: CandidateInput[] = [];
 	for (const item of parsed) {
 		if (typeof item !== "object" || item === null) continue;

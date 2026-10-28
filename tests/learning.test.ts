@@ -60,8 +60,10 @@ function fakeContext(
 	reply: string | (() => Promise<never>),
 	captured: CapturedRequest = {},
 	thinkingLevel: string | undefined = "high",
+	message: Record<string, unknown> = {},
 ): ExtensionContext {
-	const respond = async () => (typeof reply === "string" ? assistantMessage(reply) : reply());
+	const respond = async () =>
+		typeof reply === "string" ? assistantMessage(reply, message) : reply();
 	return {
 		model: { provider: "anthropic", id: "test-model", reasoning: true },
 		thinkingLevel,
@@ -301,6 +303,10 @@ test("学习输出解析容忍代码块与无效字段", () => {
 
 	assert.equal(extractCandidates("没有 JSON"), undefined);
 	assert.equal(extractCandidates("[{broken"), undefined);
+
+	// Prose after the array must not swallow the closing bracket.
+	const withTrailingProse = `${JSON.stringify([{ kind: "fact", title: "标题", content: "正文", evidence: [] }])}\n（依据 README[1]）`;
+	assert.equal(extractCandidates(withTrailingProse)?.length, 1);
 });
 
 test("学习批次写入记忆、记录用量并清空待处理事件", async () => {
@@ -426,6 +432,61 @@ test("模型不可用时保留事件并记录错误", async () => {
 		assert.equal(Number(pending?.n), 1);
 		const error = fx.db.sqlite.prepare("SELECT value FROM meta WHERE key = 'last_learning_error'").get();
 		assert.match(String(error?.value), /provider down/);
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+test("输出被截断时救回完整候选，并如实报告截断而不是非法 JSON", async () => {
+	const fx = fixture();
+	try {
+		captureToolResult(
+			fx.db,
+			"s",
+			toolResult({ toolName: "edit", toolCallId: "e1", input: { path: "src/auth/refresh.ts" } }),
+		);
+		// A real truncation: the array never closes and the second candidate is cut
+		// mid-string, exactly what a maxTokens cut-off produces.
+		const truncated = [
+			'[{"kind":"pitfall","title":"刷新竞态","content":"并发刷新需要 singleflight 合并。","layer":"repo","repo":"backend","evidence":[{"repo":"backend","path":"src/auth/refresh.ts"}],"tags":["auth"]},',
+			'{"kind":"fact","title":"认证协议","content":"统一使用 Auth API',
+		].join("");
+		const outcome = await runLearningBatch(
+			fakeContext(truncated, {}, "high", {
+				stopReason: "length",
+				usage: { input: 900, output: 6000, cacheRead: 0, cacheWrite: 0, totalTokens: 6900, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.01 } },
+			}),
+			{ db: fx.db, scope: fx.scope, defaults: fx.config.defaults, prompts: {}, sessionId: "s" },
+		);
+		assert.equal(outcome.status, "ok");
+		assert.equal(outcome.created, 1, "截断前的完整候选必须被保存");
+		assert.match(outcome.reason ?? "", /截断/);
+		const saved = fx.db.sqlite.prepare("SELECT title FROM memories").all();
+		assert.equal(saved.length, 1);
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+test("截断且没有完整候选时保留事件并报告截断", async () => {
+	const fx = fixture();
+	try {
+		captureToolResult(
+			fx.db,
+			"s",
+			toolResult({ toolName: "write", toolCallId: "w1", input: { path: "src/a.ts" } }),
+		);
+		const outcome = await runLearningBatch(
+			fakeContext('[{"kind":"pitfall","title":"刷新竞', {}, "high", {
+				stopReason: "length",
+				usage: { input: 900, output: 6000, cacheRead: 0, cacheWrite: 0, totalTokens: 6900, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.01 } },
+			}),
+			{ db: fx.db, scope: fx.scope, defaults: fx.config.defaults, prompts: {}, sessionId: "s" },
+		);
+		assert.equal(outcome.status, "error");
+		assert.match(outcome.reason ?? "", /截断/);
+		const pending = fx.db.sqlite.prepare("SELECT count(*) AS n FROM observations WHERE processed = 0").get();
+		assert.equal(Number(pending?.n), 1, "颗粒无收时事件必须保留");
 	} finally {
 		closeMemoryDb(fx.db);
 	}

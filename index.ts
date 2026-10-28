@@ -69,8 +69,9 @@ export default function scopeMemoryExtension(pi: ExtensionAPI): void {
 				runtime.lastLearnedAt = new Date().toISOString();
 				const changes = outcome.created + outcome.updated + outcome.superseded;
 				if (changes > 0) {
+					const suffix = outcome.reason ? ` · ${outcome.reason}` : "";
 					ctx.ui.notify(
-						`记忆学习完成: 新增 ${outcome.created} · 更新 ${outcome.updated} · 替代 ${outcome.superseded} · 跳过 ${outcome.skipped}`,
+						`记忆学习完成: 新增 ${outcome.created} · 更新 ${outcome.updated} · 替代 ${outcome.superseded} · 跳过 ${outcome.skipped}${suffix}`,
 						"info",
 					);
 				}
