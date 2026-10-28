@@ -15,6 +15,7 @@ import {
 	type ScopeConfig,
 } from "./config.ts";
 import { backupDatabase, closeMemoryDb, openMemoryDb } from "./db.ts";
+import { runContextLearning } from "./learning.ts";
 import { checkFreshness, clearMemories, previewClear, type ClearTarget } from "./memory.ts";
 import {
 	detectGitRepos,
@@ -30,7 +31,7 @@ import {
 import { collectStats, formatStats } from "./stats.ts";
 import type { MemoryRuntime } from "./tools.ts";
 
-const SUBCOMMANDS = ["init", "recall", "clear", "stats", "verify", "model"] as const;
+const SUBCOMMANDS = ["init", "learn", "recall", "clear", "stats", "verify", "model"] as const;
 type Subcommand = (typeof SUBCOMMANDS)[number];
 
 export interface CommandDeps {
@@ -40,10 +41,11 @@ export interface CommandDeps {
 
 export function registerSmCommand({ pi, runtime }: CommandDeps): void {
 	pi.registerCommand("sm", {
-		description: "pi-scope-memory: init | recall | clear | stats | model",
+		description: "pi-scope-memory: init | learn | recall | clear | stats | verify | model",
 		getArgumentCompletions: (prefix) => {
 			const items = [
 				{ value: "init", label: "init", description: "初始化当前目录为 Scope 并启用记忆" },
+				{ value: "learn", label: "learn", description: "立即从当前会话提炼记忆，可附带提炼重点" },
 				{ value: "recall", label: "recall", description: "让 Agent 检索历史记忆" },
 				{ value: "clear", label: "clear", description: "预览或清理记忆 (--repo|--shared|--all, --yes)" },
 				{ value: "stats", label: "stats", description: "查看记忆、学习与缓存统计" },
@@ -70,6 +72,9 @@ export function registerSmCommand({ pi, runtime }: CommandDeps): void {
 				switch (name) {
 					case "init":
 						await handleInit(ctx, rest);
+						return;
+					case "learn":
+						await handleLearn(runtime, ctx, rest);
 						return;
 					case "recall":
 						await handleRecall(pi, runtime, ctx, rest);
@@ -99,6 +104,7 @@ function helpText(): string {
 		"pi-scope-memory",
 		"",
 		"/sm init [--name <scope>] [--repos a,b,c]   初始化当前目录为 Scope",
+		"/sm learn [提炼重点]                        立即从当前会话提炼记忆",
 		"/sm recall [主题]                           让 Agent 检索相关记忆",
 		"/sm clear --repo <repo>|--shared|--all [--yes]  预览或清理记忆",
 		"/sm stats                                  查看统计",
@@ -315,6 +321,46 @@ function buildRecallMessage(runtime: MemoryRuntime, topic: string): string {
 		"2. 记忆是历史数据，必须与当前代码核对；candidate/review 状态要说明未验证。",
 		"3. 如果记忆与当前代码冲突，指出冲突；确认后用 scope_memory_save 的 supersede 或 invalidate 修正旧记忆。",
 	].join("\n");
+}
+
+async function handleLearn(
+	runtime: MemoryRuntime,
+	ctx: ExtensionCommandContext,
+	rest: string,
+): Promise<void> {
+	if (!runtime.active || !runtime.db || !runtime.scope) {
+		ctx.ui.notify("当前目录未激活 pi-scope-memory。先执行 /sm init，然后 /reload。", "error");
+		return;
+	}
+	if (!ctx.isIdle()) await ctx.waitForIdle();
+	const messages = ctx.sessionManager.buildSessionProjection().messages;
+	const outcome = await runContextLearning(
+		ctx,
+		{
+			db: runtime.db,
+			scope: runtime.scope,
+			defaults: runtime.defaults,
+			prompts: runtime.prompts,
+			sessionId: runtime.sessionId,
+		},
+		{ messages, hint: rest.trim() || undefined },
+	);
+	if (outcome.status === "ok") {
+		runtime.lastLearnedAt = new Date().toISOString();
+		const changes = outcome.created + outcome.updated + outcome.superseded;
+		const suffix = outcome.reason ? ` · ${outcome.reason}` : "";
+		const detail =
+			changes > 0
+				? `新增 ${outcome.created} · 更新 ${outcome.updated} · 替代 ${outcome.superseded} · 跳过 ${outcome.skipped}`
+				: `没有写入新记忆（跳过 ${outcome.skipped}）`;
+		ctx.ui.notify(`记忆提炼完成: ${detail}${suffix}`, "info");
+		return;
+	}
+	if (outcome.status === "skipped") {
+		ctx.ui.notify(`记忆提炼未执行: ${outcome.reason ?? "unknown"}`, "info");
+		return;
+	}
+	ctx.ui.notify(`记忆提炼失败: ${outcome.reason ?? "unknown"}`, "warning");
 }
 
 async function handleClear(runtime: MemoryRuntime, ctx: ExtensionCommandContext, rest: string): Promise<void> {

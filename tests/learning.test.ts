@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { after, beforeEach, test } from "node:test";
 import { join } from "node:path";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import type { ExtensionContext, ToolResultEvent } from "@earendil-works/pi-coding-agent";
 import { closeMemoryDb, openMemoryDb, type MemoryDb } from "../src/db.ts";
 import {
@@ -8,8 +9,10 @@ import {
 	extractCandidates,
 	isInterestingToolResult,
 	recordTurn,
+	runContextLearning,
 	runLearningBatch,
 	shouldLearn,
+	type LearningDeps,
 } from "../src/learning.ts";
 import { saveMemory, searchMemories } from "../src/memory.ts";
 import { recordLearningUsage } from "../src/stats.ts";
@@ -612,6 +615,115 @@ test("非法 JSON 触发有限重试而不是无限循环", async () => {
 		assert.equal(rows.length, 1);
 		assert.equal(Number(rows[0]?.attempts), 3);
 		assert.equal(Number(rows[0]?.processed), 1);
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+function userMessage(text: string): AgentMessage {
+	return { role: "user", content: [{ type: "text", text }], timestamp: Date.now() };
+}
+
+function assistantDialogue(text: string): AgentMessage {
+	return assistantMessage(text) as unknown as AgentMessage;
+}
+
+const CONTEXT_REPLY = JSON.stringify([
+	{
+		kind: "decision",
+		title: "认证刷新使用 refresh token 轮换",
+		content: "认证刷新采用 refresh token 轮换，不退回 Session。",
+		layer: "repo",
+		repo: "backend",
+		evidence: [{ repo: "backend", path: "src/auth/refresh.ts", reason: "刷新逻辑实现位置" }],
+		tags: ["auth"],
+	},
+]);
+
+function contextDeps(fx: Fixture): LearningDeps {
+	return { db: fx.db, scope: fx.scope, defaults: fx.config.defaults, prompts: {}, sessionId: "s" };
+}
+
+test("手动提炼：会话记录是来源，用户输入只作为提炼提示", async () => {
+	const fx = fixture();
+	try {
+		captureToolResult(
+			fx.db,
+			"s",
+			toolResult({ toolName: "write", toolCallId: "w1", input: { path: "src/auth/refresh.ts" } }),
+		);
+		const captured: CapturedRequest = {};
+		const outcome = await runContextLearning(fakeContext(CONTEXT_REPLY, captured), contextDeps(fx), {
+			messages: [
+				userMessage("认证刷新必须使用 refresh token 轮换，不要改回 Session。"),
+				assistantDialogue("已确认：轮换逻辑位于 backend/src/auth/refresh.ts。"),
+			],
+			hint: "只记录认证刷新相关的约束",
+		});
+
+		assert.equal(outcome.status, "ok");
+		assert.equal(outcome.created, 1);
+		assert.match(captured.prompt ?? "", /只记录认证刷新相关的约束/);
+		assert.match(captured.prompt ?? "", /不要改回 Session/);
+		assert.match(captured.prompt ?? "", /不是事实来源/);
+		assert.match(captured.systemPrompt ?? "", /当前会话记录/);
+
+		const pending = fx.db.sqlite.prepare("SELECT count(*) AS n FROM observations WHERE processed = 0").get();
+		assert.equal(Number(pending?.n), 1, "手动提炼不应消费自动学习的事件队列");
+		const usage = fx.db.sqlite.prepare("SELECT count(*) AS n FROM usage_stats WHERE source = 'learning'").get();
+		assert.equal(Number(usage?.n), 1, "手动提炼的用量必须计入学习成本");
+		const hits = searchMemories(
+			fx.db,
+			fx.scope,
+			{ query: "refresh token 轮换" },
+			fx.config.defaults.retrieval,
+		);
+		assert.ok(hits.hits.length > 0, "提炼结果必须能从同一 Scope 检索到");
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+test("手动提炼：没有对话时跳过且不调用模型", async () => {
+	const fx = fixture();
+	try {
+		const captured: CapturedRequest = {};
+		const outcome = await runContextLearning(fakeContext(CONTEXT_REPLY, captured), contextDeps(fx), {
+			messages: [],
+		});
+		assert.equal(outcome.status, "skipped");
+		assert.match(outcome.reason ?? "", /没有可提炼的对话/);
+		assert.equal(captured.prompt, undefined);
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+test("手动提炼：使用独立提示词，不与观察事件提示词混用", async () => {
+	const fx = fixture();
+	try {
+		const messages = [userMessage("记录一条偏好。"), assistantDialogue("好的。")];
+		const autoOnly: CapturedRequest = {};
+		await runContextLearning(fakeContext(CONTEXT_REPLY, autoOnly), {
+			...contextDeps(fx),
+			prompts: { learningSystem: "只处理观察事件的规则" },
+		}, { messages });
+		assert.match(autoOnly.systemPrompt ?? "", /当前会话记录/);
+		assert.doesNotMatch(autoOnly.systemPrompt ?? "", /只处理观察事件的规则/);
+
+		const explicit: CapturedRequest = {};
+		await runContextLearning(fakeContext(CONTEXT_REPLY, explicit), {
+			...contextDeps(fx),
+			prompts: {
+				learningSystem: "只处理观察事件的规则",
+				manualLearningSystem: "自定义会话提炼规则",
+				learningGuidance: "优先记录认证相关约束",
+			},
+		}, { messages });
+		assert.match(explicit.systemPrompt ?? "", /^自定义会话提炼规则/);
+		assert.match(explicit.systemPrompt ?? "", /优先记录认证相关约束/);
+		assert.match(explicit.systemPrompt ?? "", /只输出 JSON 数组/);
+		assert.doesNotMatch(explicit.systemPrompt ?? "", /只处理观察事件的规则/);
 	} finally {
 		closeMemoryDb(fx.db);
 	}

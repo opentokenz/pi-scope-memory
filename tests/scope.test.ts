@@ -154,11 +154,12 @@ test("配置校验：非法仓库路径、重复 ID、错误版本都会失败",
 	assert.equal(explicit.defaults.learningThinkingLevel, "low");
 });
 
-test("全局提示词配置：学习系统提示词、补充要求与 recall 模板", () => {
+test("全局提示词配置：两条学习路径的提示词、补充要求与 recall 模板", () => {
 	const config = parseConfig({
 		version: 1,
 		prompts: {
 			learningSystem: "自定义提炼器规则",
+			manualLearningSystem: "自定义会话提炼器规则",
 			learningGuidance: "优先记录认证相关约束",
 			recall: "请检索 {scope}/{repo}，主题: {topic}",
 		},
@@ -166,6 +167,7 @@ test("全局提示词配置：学习系统提示词、补充要求与 recall 模
 	});
 	assert.deepEqual(config.prompts, {
 		learningSystem: "自定义提炼器规则",
+		manualLearningSystem: "自定义会话提炼器规则",
 		learningGuidance: "优先记录认证相关约束",
 		recall: "请检索 {scope}/{repo}，主题: {topic}",
 	});

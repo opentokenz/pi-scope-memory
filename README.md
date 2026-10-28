@@ -26,6 +26,7 @@
 - [配置](#配置)
 - [学习模型与思考强度](#学习模型与思考强度)
 - [自动学习](#自动学习)
+  - [手动提炼](#手动提炼)
 - [记忆质量与生命周期](#记忆质量与生命周期)
 - [检索与召回](#检索与召回)
 - [Prompt Cache](#prompt-cache)
@@ -57,6 +58,7 @@ pi-scope-memory 把“工程记忆”从对话历史里拆出来：
 - **证据驱动**：实现事实需要真实文件证据；无证据的知识保存为未验证候选。
 - **写入前检索**：新增记忆前先查同层历史，自动更新重复项、替代冲突项或跳过已有 Shared 结论。
 - **自动学习**：轻量事件采集加批量 LLM 提炼，支持独立模型、思考强度、每日预算和失败重试。
+- **手动提炼**：`/sm learn` 立即从当前会话提炼记忆，可附带一段提示指定重点，不必等事件阈值。
 - **可控清理**：预览后删除，删除前生成一致性备份，只作用于当前 Scope。
 - **本地优先**：SQLite + FTS5，一个 Scope 一个数据库，无后台服务、无向量数据库。
 
@@ -128,6 +130,7 @@ cd ~/Projects/enterprise
 | 命令 | 作用 |
 | --- | --- |
 | `/sm init [--name <scope>] [--repos a,b,c]` | 初始化并启用当前目录 Scope |
+| `/sm learn [提炼重点]` | 立即从当前会话上下文提炼记忆，参数只用于指定提炼重点 |
 | `/sm recall [主题]` | 让 Agent 调用 `scope_memory_search` 检索历史记忆 |
 | `/sm clear --repo <repo> \| --shared \| --all [--yes]` | 预览或清理记忆 |
 | `/sm stats` | 记忆、检索、零命中率、review 比例、路径提示、学习与成本统计 |
@@ -303,14 +306,16 @@ Agent 调用这两个工具时，TUI 或 RPC 客户端会收到一条临时通�
 {
   "prompts": {
     "learningSystem": "你是团队的项目记忆提炼器……",
+    "manualLearningSystem": "你是团队的会话记忆提炼器……",
     "learningGuidance": "优先记录认证、支付相关的跨仓库约束。",
     "recall": "请先调用 scope_memory_search 检索 {scope}/{repo} 的历史记忆。\n可用仓库: {repos}\n检索主题: {topic}"
   }
 }
 ```
 
-- `learningSystem`：完整替换内置学习系统提示词。插件仍会在末尾追加 JSON 输出格式要求，保证学习结果可解析。
-- `learningGuidance`：追加到学习提示词中的额外要求，适合小范围调整，不必复制整段系统提示词。
+- `learningSystem`：完整替换自动学习的系统提示词（基于工具事件提炼）。插件仍会在末尾追加 JSON 输出格式要求，保证学习结果可解析。
+- `manualLearningSystem`：完整替换 `/sm learn` 的系统提示词（基于当前会话记录提炼）。不设置时使用内置的会话提炼提示词，不会继承 `learningSystem`。插件同样会追加 JSON 输出格式要求。
+- `learningGuidance`：追加到两条学习路径的额外要求，适合放两端共用的团队规则，不必复制整段系统提示词。
 - `recall`：`/sm recall` 发送的用户消息模板。支持 `{scope}`、`{repo}`、`{repos}`、`{topic}` 四个占位符。模板中应保留对 `scope_memory_search` 的明确要求，否则 Agent 可能不会调用工具。模板缺少 `{topic}` 但用户输入了主题时，插件会在消息末尾追加「检索主题: …」；未提供主题时，`{topic}` 会替换为默认的推断语句。
 - 空字符串表示使用内置默认值。提示词只影响学习与召回文本，不会改变工具声明或系统提示词的固定前缀。
 
@@ -348,6 +353,22 @@ Collector 只记录有价值的事件指针，不保存原始输出和源码：
 - 学习产生的用量单独记入 `usage_stats(source='learning')`，不与主 Agent 用量混算。
 - 候选记忆仍然经过同一套去重、冲突与证据验证，不因为来自学习就跳过校验。
 - 已处理事件保留 14 天后清理；`/sm clear --all` 可立即清理。
+
+### 手动提炼
+
+`/sm learn` 不等待 `learningMinEvents` 或 `learningIntervalTurns`，立即读取当前会话上下文并调用学习模型：
+
+```text
+/sm learn
+/sm learn 只记录认证刷新相关的约束
+```
+
+- 事实来源是当前会话中的用户消息与助手结论，忽略工具输出、思考内容和扩展消息；命令后的文字只作为提炼重点，本身不作为事实。
+- 与自动学习共用学习模型、思考强度、每日 Token 预算和候选保存流程，因此同样经过去重、冲突检测与证据验证。
+- 系统提示词由 `prompts.manualLearningSystem` 控制；`prompts.learningSystem` 只作用于自动学习，两者不会互相覆盖。`learningGuidance` 对两条路径都生效。
+- 不消费 `observations` 中的待处理事件，也不重置自动学习的计数；两条路径可以独立运行。
+- 单次最多带入约 12000 字上下文，优先保留最近对话和会话压缩摘要；更早的对话会被省略并在提示词中标注条数。
+- 提炼失败只记录错误并通知，不会中断主 Agent；成功或失败都会在界面提示结果。
 
 ## 记忆质量与生命周期
 
@@ -390,6 +411,7 @@ Collector 只记录有价值的事件指针，不保存原始输出和源码：
 | 工具声明 | 随 Scope 在 `session_start` 固定，运行中不增删 |
 | 记忆注入 | 工具按需返回；首次触及被引用文件时的一次性路径提示 |
 | `/sm recall` | 发送新的用户消息，不改写 System Prompt |
+| `/sm learn` | 独立模型调用，不改写会话上下文与 System Prompt |
 | 原生 Compaction | 不修改 |
 | `/sm stats` | 展示 cache read / write、未缓存输入与学习成本 |
 
@@ -454,6 +476,7 @@ npm test
 - 证据验证、checkpoint 过期、文件变化复核。
 - `/sm clear` 的隔离、备份与历史版本清理。
 - 学习批次、预算、Provider 失败、非法 JSON 重试、思考强度传递。
+- 手动提炼：会话记录与提示分离、空会话跳过、不消费待处理事件、用量计入学习成本。
 - 多进程并发写入、Prompt Cache 结构约束（不注册每轮注入钩子）。
 
 贡献前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)。
@@ -468,7 +491,7 @@ src/db.ts           SQLite/FTS5、迁移、事务、备份
 src/memory.ts       检索、去重、冲突替代、证据验证、过期
 src/learning.ts     事件采集、批量提炼、模型调用、降级
 src/tools.ts        两个 Agent 工具与工具激活
-src/commands.ts     五个 /sm 子命令
+src/commands.ts     七个 /sm 子命令
 src/stats.ts        记忆、Token、缓存与成本统计
 tests/              单元与端到端集成测试
 ```

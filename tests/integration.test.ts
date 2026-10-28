@@ -84,6 +84,7 @@ function makeCtx(
 	notices: string[],
 	options: {
 		sessionId?: string;
+		messages?: unknown[];
 		complete?: () => Promise<unknown>;
 		hasUI?: boolean;
 		select?: (title: string, items: string[]) => Promise<string | undefined>;
@@ -95,7 +96,15 @@ function makeCtx(
 		mode: options.hasUI ? "tui" : "print",
 		hasUI: options.hasUI === true,
 		signal: undefined,
-		sessionManager: { getSessionId: () => options.sessionId ?? "session-1" },
+		sessionManager: {
+			getSessionId: () => options.sessionId ?? "session-1",
+			buildSessionProjection: () => ({
+				entries: [],
+				messages: options.messages ?? [],
+				thinkingLevel: "medium",
+				model: null,
+			}),
+		},
 		model: fakeModel("anthropic", "test-model"),
 		modelRegistry: {
 			complete: options.complete ?? (async () => assistantMessage("[]")),
@@ -366,6 +375,77 @@ test("/sm recall 发送检索指令而不是注入 System Prompt", async () => {
 	assert.match(sent[0] ?? "", /scope_memory_search/);
 	assert.match(sent[0] ?? "", /认证模块以前为什么放弃 Session/);
 	assert.match(sent[0] ?? "", /backend/);
+	await h.shutdown();
+});
+
+test("/sm learn 从当前会话提炼记忆，用户输入作为提炼提示", async () => {
+	const { root } = enterpriseSetup();
+	writeFile(join(root, "backend"), "src/auth/refresh.ts", "export function rotate() {}\n");
+	const notices: string[] = [];
+	const h = harness(notices);
+	let prompt = "";
+	const reply = JSON.stringify([
+		{
+			kind: "decision",
+			title: "认证刷新使用 refresh token 轮换",
+			content: "认证刷新采用 refresh token 轮换，不退回 Session。",
+			layer: "repo",
+			repo: "backend",
+			evidence: [{ repo: "backend", path: "src/auth/refresh.ts", reason: "刷新逻辑实现位置" }],
+			tags: ["auth"],
+		},
+	]);
+	const messages = [
+		{
+			role: "user",
+			content: [{ type: "text", text: "认证刷新必须使用 refresh token 轮换，不要改回 Session。" }],
+			timestamp: Date.now(),
+		},
+		{
+			role: "assistant",
+			content: [{ type: "text", text: "已确认：轮换逻辑位于 backend/src/auth/refresh.ts。" }],
+			timestamp: Date.now(),
+		},
+	];
+	const ctx = makeCtx(join(root, "backend"), notices, {
+		sessionId: "manual-learn",
+		messages,
+		streamSimple: (_model, context) => {
+			const request = context as { messages?: { content?: { text?: string }[] }[] };
+			prompt = request.messages?.[0]?.content?.[0]?.text ?? "";
+			return { result: async () => assistantMessage(reply) };
+		},
+	});
+	await h.sessionStart(ctx);
+	await h.commands.get("sm")?.handler("learn 只记录认证刷新相关的约束", ctx as unknown as ExtensionCommandContext);
+
+	assert.match(prompt, /只记录认证刷新相关的约束/, "用户输入必须作为提炼提示进入提示词");
+	assert.match(prompt, /不要改回 Session/, "当前会话内容必须作为提炼来源");
+	assert.match(prompt, /不是事实来源/);
+	assert.ok(notices.some((notice) => notice.includes("记忆提炼完成") && notice.includes("新增 1")));
+
+	const found = await execute(h, "scope_memory_search", { query: "refresh token 轮换" });
+	assert.match(found.text, /refresh token 轮换/);
+	assert.equal(found.details.repoId, "backend");
+	await h.shutdown();
+});
+
+test("/sm learn 在没有对话时跳过且不调用模型", async () => {
+	const { root } = enterpriseSetup();
+	const notices: string[] = [];
+	const h = harness(notices);
+	let calls = 0;
+	const ctx = makeCtx(join(root, "backend"), notices, {
+		messages: [],
+		streamSimple: () => {
+			calls += 1;
+			return { result: async () => assistantMessage("[]") };
+		},
+	});
+	await h.sessionStart(ctx);
+	await h.commands.get("sm")?.handler("learn", ctx as unknown as ExtensionCommandContext);
+	assert.equal(calls, 0);
+	assert.ok(notices.some((notice) => notice.includes("当前会话没有可提炼的对话")));
 	await h.shutdown();
 });
 

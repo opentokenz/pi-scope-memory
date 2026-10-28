@@ -51,9 +51,11 @@ export interface ScopeConfig {
 }
 
 export interface PromptConfig {
-	/** Full replacement for the built-in learner system prompt. */
+	/** Full replacement for the built-in learner system prompt (automatic passes). */
 	learningSystem?: string;
-	/** Extra rules appended to the learner prompt. */
+	/** Full replacement for the built-in context learner prompt used by /sm learn. */
+	manualLearningSystem?: string;
+	/** Extra rules appended to the learner prompt in both modes. */
 	learningGuidance?: string;
 	/** Template for the /sm recall user message. */
 	recall?: string;
@@ -283,7 +285,7 @@ function parsePrompts(value: unknown): PromptConfig {
 	if (value === undefined) return {};
 	if (!isRecord(value)) throw new ConfigError("prompts 必须是对象");
 	const prompts: PromptConfig = {};
-	for (const key of ["learningSystem", "learningGuidance", "recall"] as const) {
+	for (const key of ["learningSystem", "manualLearningSystem", "learningGuidance", "recall"] as const) {
 		const raw = value[key];
 		if (raw === undefined) continue;
 		if (typeof raw !== "string") throw new ConfigError(`prompts.${key} 必须是字符串`);
