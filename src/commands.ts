@@ -120,7 +120,7 @@ async function handleInit(ctx: ExtensionCommandContext, rest: string): Promise<v
 	}
 
 	const activeHere = resolveScope(config, root);
-	if (activeHere.active && activeHere.resolved.root !== root) {
+	if (activeHere.active && activeHere.resolved.root !== root && nameFlag === undefined) {
 		ctx.ui.notify(
 			`当前目录已属于 Scope ${activeHere.resolved.scopeId}（根目录 ${activeHere.resolved.root}）。请到该根目录执行 /sm init，或使用 --name 新建独立 Scope。`,
 			"error",
@@ -200,11 +200,28 @@ async function handleInit(ctx: ExtensionCommandContext, rest: string): Promise<v
 		return;
 	}
 
-	if (conflicts.length > 0) {
-		const lines = conflicts
+	// Nested scopes are a supported config shape: resolveScope activates the most
+	// specific root. Refuse an overlapping directory only when the user did not
+	// name the scope explicitly, which is how an accidental `/sm init` inside an
+	// existing tree looks.
+	const overlaps = conflicts.filter((conflict) => conflict.kind === "overlap");
+	if (overlaps.length > 0 && nameFlag === undefined) {
+		const lines = overlaps
 			.map((conflict) => `- ${conflict.kind}: Scope ${conflict.scopeId} (${conflict.root})`)
 			.join("\n");
-		ctx.ui.notify(`Scope 路径与现有配置重叠，已拒绝写入:\n${lines}`, "error");
+		ctx.ui.notify(
+			`Scope 路径与现有配置重叠，已拒绝写入:\n${lines}\n\n如需在该目录树内建立独立 Scope，请显式指定 --name。`,
+			"error",
+		);
+		return;
+	}
+
+	const blocking = conflicts.filter((conflict) => conflict.kind !== "overlap");
+	if (blocking.length > 0) {
+		const lines = blocking
+			.map((conflict) => `- ${conflict.kind}: Scope ${conflict.scopeId} (${conflict.root})`)
+			.join("\n");
+		ctx.ui.notify(`Scope 路径与现有配置冲突，已拒绝写入:\n${lines}`, "error");
 		return;
 	}
 
@@ -235,6 +252,12 @@ async function handleInit(ctx: ExtensionCommandContext, rest: string): Promise<v
 		`根目录: ${scope.root}`,
 		`仓库: ${formatRepos(scope)}`,
 		`数据库: ${probe.path}`,
+		...(overlaps.length > 0
+			? [
+				`嵌套于: ${overlaps.map((conflict) => `Scope ${conflict.scopeId} (${conflict.root})`).join("、")}`,
+				"该目录树内按最具体的 Scope 激活，内层不会回退到外层。",
+			]
+			: []),
 		"",
 		"运行 /reload 让记忆工具在本会话生效；新会话会自动加载。",
 	];

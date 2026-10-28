@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import extension from "../index.ts";
 import { loadConfig, writeConfig } from "../src/config.ts";
+import { resolveScope } from "../src/scope.ts";
 import { assistantMessage, cleanupTempDirs, makeConfig, makeRepos, tempRoot, useIsolatedHome, writeFile, scopeConfig } from "./helpers.ts";
 
 after(cleanupTempDirs);
@@ -610,20 +611,70 @@ test("根目录本身是仓库时，一级子仓库优先注册", async () => {
 	await h.shutdown();
 });
 
-test("/sm init 拒绝重叠 Scope", async () => {
+test("/sm init 拒绝未指定 --name 的重叠 Scope", async () => {
 	const base = tempRoot();
 	const { configPath } = useIsolatedHome(base);
 	const outer = join(base, "outer");
 	makeRepos(outer, ["backend"]);
 	writeConfig(makeConfig([scopeConfig(outer)]), configPath);
-	const innerRoot = join(outer, "backend");
+	// 未注册为仓库的内层目录：不会命中「已属于 Scope」前置检查，直接落到重叠检查。
+	const innerRoot = join(outer, "inner");
+	makeRepos(innerRoot, ["service-a"]);
 	const notices: string[] = [];
 	const h = harness(notices);
-	// 通过嵌套目录触发冲突：根目录本身已在 Scope 内。
-	await h.commands.get("sm")?.handler("init --name inner", makeCtx(innerRoot, notices) as unknown as ExtensionCommandContext);
-	assert.ok(notices.some((notice) => notice.includes("已属于 Scope") || notice.includes("重叠")));
+	await h.commands.get("sm")?.handler("init", makeCtx(innerRoot, notices) as unknown as ExtensionCommandContext);
+	assert.ok(notices.some((notice) => notice.includes("重叠")));
 	const loaded = loadConfig(configPath);
 	if (loaded.status === "loaded") assert.equal(loaded.config.scopes.length, 1);
+	await h.shutdown();
+});
+
+test("/sm init --name 允许在已有 Scope 目录树内建立嵌套 Scope", async () => {
+	const base = tempRoot();
+	const { configPath, dataDir } = useIsolatedHome(base);
+	const outer = join(base, "outer");
+	makeRepos(outer, ["backend"]);
+	writeConfig(makeConfig([scopeConfig(outer)]), configPath);
+	const innerRoot = join(outer, "inner");
+	makeRepos(innerRoot, ["service-a", "service-b"]);
+	const notices: string[] = [];
+	const h = harness(notices);
+
+	await h.commands.get("sm")?.handler(
+		"init --name inner",
+		makeCtx(innerRoot, notices) as unknown as ExtensionCommandContext,
+	);
+
+	const loaded = loadConfig(configPath);
+	assert.equal(loaded.status, "loaded");
+	if (loaded.status !== "loaded") return;
+	assert.equal(loaded.config.scopes.length, 2);
+	const inner = loaded.config.scopes.find((scope) => scope.id === "inner");
+	assert.equal(inner?.root, innerRoot);
+	assert.deepEqual(inner?.repos, { "service-a": "service-a", "service-b": "service-b" });
+	assert.ok(existsSync(join(dataDir, "scopes", "inner", "memory.sqlite")));
+	assert.ok(notices.some((notice) => notice.includes("嵌套于")));
+
+	// 运行时按最具体目录归属：内层目录进 inner，外层仓库仍属 outer。
+	const innerResolved = resolveScope(loaded.config, join(innerRoot, "service-a"));
+	assert.equal(innerResolved.active, true);
+	if (innerResolved.active) assert.equal(innerResolved.resolved.scopeId, "inner");
+	const outerResolved = resolveScope(loaded.config, join(outer, "backend"));
+	assert.equal(outerResolved.active, true);
+	if (outerResolved.active) assert.equal(outerResolved.resolved.scopeId, "enterprise");
+
+	// 已注册仓库目录也可以用 --name 拆成独立内层 Scope。
+	await h.commands.get("sm")?.handler(
+		"init --name backend-solo",
+		makeCtx(join(outer, "backend"), notices) as unknown as ExtensionCommandContext,
+	);
+	const split = loadConfig(configPath);
+	assert.equal(split.status, "loaded");
+	if (split.status === "loaded") {
+		assert.ok(split.config.scopes.some((scope) => scope.id === "backend-solo"));
+		const splitResolved = resolveScope(split.config, join(outer, "backend"));
+		if (splitResolved.active) assert.equal(splitResolved.resolved.scopeId, "backend-solo");
+	}
 	await h.shutdown();
 });
 
