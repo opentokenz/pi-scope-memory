@@ -8,6 +8,7 @@ import { resolveScope, type ResolvedScope } from "./src/scope.ts";
 import { recordSessionUsage } from "./src/stats.ts";
 import {
 	activateMemoryTools,
+	buildPathHint,
 	createMemoryRuntime,
 	deactivateMemoryTools,
 	registerMemoryTools,
@@ -32,6 +33,12 @@ export default function scopeMemoryExtension(pi: ExtensionAPI): void {
 			captureToolResult(runtime.db, runtime.sessionId, event);
 		} catch (error) {
 			reportQuietly(ctx, `采集工具事件失败: ${errorMessage(error)}`);
+		}
+		try {
+			const hint = buildPathHint(runtime, event);
+			if (hint) return { content: [...event.content, { type: "text" as const, text: hint }] };
+		} catch (error) {
+			reportQuietly(ctx, `生成记忆提示失败: ${errorMessage(error)}`);
 		}
 	});
 
@@ -97,6 +104,9 @@ async function startSession(pi: ExtensionAPI, runtime: MemoryRuntime, ctx: Exten
 	runtime.scope = undefined;
 	runtime.active = false;
 	runtime.sessionId = safeSessionId(ctx);
+	runtime.checkedPaths.clear();
+	runtime.hintsShown = 0;
+	runtime.hintPending = false;
 
 	const loaded = loadConfig();
 	if (loaded.status === "missing") {

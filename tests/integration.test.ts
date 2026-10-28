@@ -247,6 +247,114 @@ test("重复保存同一结论时更新而不是新增", async () => {
 	await h.shutdown();
 });
 
+test("/sm verify 重新核对证据并在恢复后回到 active", async () => {
+	const { root } = enterpriseSetup();
+	const notices: string[] = [];
+	const h = harness(notices);
+	await h.sessionStart(makeCtx(join(root, "backend"), notices));
+	await execute(h, "scope_memory_save", {
+		action: "upsert",
+		kind: "fact",
+		title: "hikari 连接池",
+		content: "后端连接池使用 hikari 标识。",
+		evidence: [{ repo: "backend", path: "src/db.ts" }],
+	});
+
+	writeFile(join(root, "backend"), "src/db.ts", "export const pool = 'pg';\n");
+	await h.commands.get("sm")?.handler("verify", makeCtx(join(root, "backend"), notices) as unknown as ExtensionCommandContext);
+	assert.ok(notices.some((notice) => notice.includes("标记 review 1")), notices.join("\n"));
+
+	writeFile(join(root, "backend"), "src/db.ts", "export const pool = 'hikari';\n");
+	await h.commands.get("sm")?.handler("verify", makeCtx(join(root, "backend"), notices) as unknown as ExtensionCommandContext);
+	assert.ok(notices.some((notice) => notice.includes("恢复 active 1")), notices.join("\n"));
+	await h.shutdown();
+});
+
+test("读取证据文件时追加一次性记忆提示", async () => {
+	const { root } = enterpriseSetup();
+	const notices: string[] = [];
+	const h = harness(notices);
+	await h.sessionStart(makeCtx(join(root, "backend"), notices));
+	await execute(h, "scope_memory_save", {
+		action: "upsert",
+		kind: "fact",
+		title: "连接池使用 HikariCP",
+		content: "后端连接池使用 HikariCP。",
+		evidence: [{ repo: "backend", path: "src/db.ts" }],
+	});
+
+	const handler = h.handlers.get("tool_result");
+	assert.ok(handler);
+	const ctx = makeCtx(join(root, "backend"), notices) as unknown as ExtensionContext;
+	const read = (path: string) =>
+		handler(
+			{
+				type: "tool_result",
+				toolCallId: `read-${path}`,
+				toolName: "read",
+				input: { path },
+				content: [{ type: "text", text: "export const pool = 'hikari';" }],
+				isError: false,
+			},
+			ctx,
+		);
+
+	const first = (await read("src/db.ts")) as { content?: { text: string }[] } | undefined;
+	assert.match(first?.content?.map((part) => part.text).join("\n") ?? "", /长期记忆提示/);
+	assert.match(first?.content?.map((part) => part.text).join("\n") ?? "", /连接池使用 HikariCP/);
+
+	const second = (await read("src/db.ts")) as { content?: { text: string }[] } | undefined;
+	assert.ok(!second?.content?.some((part) => part.text.includes("长期记忆提示")), "同一路径只提示一次");
+	const unrelated = (await read("src/other.ts")) as { content?: { text: string }[] } | undefined;
+	assert.ok(!unrelated?.content?.some((part) => part.text.includes("长期记忆提示")), "无证据文件不提示");
+
+	await execute(h, "scope_memory_search", { query: "HikariCP" });
+	await h.commands.get("sm")?.handler("stats", makeCtx(root, notices) as unknown as ExtensionCommandContext);
+	assert.ok(
+		notices.some((notice) => /Memory Hints\s+shown 1 · followed 1/.test(notice)),
+		notices.join("\n"),
+	);
+	await h.shutdown();
+});
+
+test("每个会话最多追加 3 条路径提示", async () => {
+	const { root } = enterpriseSetup();
+	const notices: string[] = [];
+	const h = harness(notices);
+	await h.sessionStart(makeCtx(join(root, "backend"), notices));
+	const names = ["a.ts", "b.ts", "c.ts", "d.ts"];
+	for (const name of names) {
+		writeFile(join(root, "backend"), `src/${name}`, `export const ${name.replace(".", "_")} = true;\n`);
+		await execute(h, "scope_memory_save", {
+			action: "upsert",
+			kind: "fact",
+			title: `${name} 的约定`,
+			content: `${name} 存放模块约定。`,
+			evidence: [{ repo: "backend", path: `src/${name}` }],
+		});
+	}
+	const handler = h.handlers.get("tool_result");
+	assert.ok(handler);
+	const ctx = makeCtx(join(root, "backend"), notices) as unknown as ExtensionContext;
+	let hints = 0;
+	for (const name of names) {
+		const result = (await handler(
+			{
+				type: "tool_result",
+				toolCallId: `read-${name}`,
+				toolName: "read",
+				input: { path: `src/${name}` },
+				content: [{ type: "text", text: "content" }],
+				isError: false,
+			},
+			ctx,
+		)) as { content?: { text: string }[] } | undefined;
+		if (result?.content?.some((part) => part.text.includes("长期记忆提示"))) hints += 1;
+	}
+	assert.equal(hints, 3);
+	await h.shutdown();
+});
+
 test("/sm recall 发送检索指令而不是注入 System Prompt", async () => {
 	const { root } = enterpriseSetup();
 	const notices: string[] = [];

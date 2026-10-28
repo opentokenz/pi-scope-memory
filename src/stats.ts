@@ -18,6 +18,8 @@ export interface ScopeStats {
 	byLayer: Record<string, number>;
 	byStatus: Record<string, number>;
 	searchCalls: number;
+	searchZeroCalls: number;
+	revisionOps: Record<string, number>;
 	session: TokenTotals;
 	cacheReadRatio: number | null;
 	learning: TokenTotals;
@@ -26,6 +28,8 @@ export interface ScopeStats {
 	retrievalTokens: number;
 	pendingEvents: number;
 	verificationFailures: number;
+	hintsShown: number;
+	hintsFollowed: number;
 	lastLearningAt?: string;
 	lastLearningError?: string;
 }
@@ -35,6 +39,10 @@ export function collectStats(db: MemoryDb, scope: ResolvedScope, defaults: Defau
 	const session = totals(db, "session");
 	const learning = totals(db, "learning");
 	const totalInput = session.input + session.cacheRead + session.cacheWrite;
+	const revisionOps: Record<string, number> = {};
+	for (const row of db.sqlite.prepare("SELECT operation, count(*) AS n FROM memory_revisions GROUP BY operation").all()) {
+		revisionOps[String(row.operation)] = Number(row.n);
+	}
 	return {
 		scopeId: scope.scopeId,
 		repoId: scope.repoId,
@@ -42,6 +50,8 @@ export function collectStats(db: MemoryDb, scope: ResolvedScope, defaults: Defau
 		byLayer: counts.byLayer,
 		byStatus: counts.byStatus,
 		searchCalls: getMetaNumber(db, "search_calls"),
+		searchZeroCalls: getMetaNumber(db, "search_zero"),
+		revisionOps,
 		session,
 		cacheReadRatio: totalInput === 0 ? null : session.cacheRead / totalInput,
 		learning,
@@ -50,6 +60,8 @@ export function collectStats(db: MemoryDb, scope: ResolvedScope, defaults: Defau
 		retrievalTokens: Math.round(getMetaNumber(db, "retrieval_tokens")),
 		pendingEvents: pendingObservations(db),
 		verificationFailures: getMetaNumber(db, "verification_failures"),
+		hintsShown: getMetaNumber(db, "hint_shown"),
+		hintsFollowed: getMetaNumber(db, "hint_followed"),
 		lastLearningAt: getMeta(db, "last_learning_at"),
 		lastLearningError: getMeta(db, "last_learning_error"),
 	};
@@ -68,11 +80,21 @@ export function formatStats(stats: ScopeStats, scopeName: string, repoName?: str
 		.join(" · ");
 	const cacheRatio = stats.cacheReadRatio === null ? "无数据" : `${(stats.cacheReadRatio * 100).toFixed(1)}%`;
 	const budget = stats.learningBudget > 0 ? `${formatTokens(stats.learningToday)} / ${formatTokens(stats.learningBudget)}` : "不限";
+	const zeroRate = stats.searchCalls > 0 ? `${Math.round((stats.searchZeroCalls / stats.searchCalls) * 100)}%` : "无数据";
+	const reviewCount = stats.byStatus.review ?? 0;
+	const reviewRate = stats.total > 0 ? `${Math.round((reviewCount / stats.total) * 100)}%` : "无数据";
+	const updates = stats.revisionOps.update ?? 0;
+	const supersedes = stats.revisionOps.supersede ?? 0;
 	const lines = [
 		`Scope: ${scopeName}${repoName ? ` · Repo: ${repoName}` : " · Repo: (scope root)"}`,
 		"",
 		`Active Memories      ${active}`,
 		`Search Calls         ${stats.searchCalls}`,
+		`Zero-hit Searches    ${stats.searchZeroCalls}/${stats.searchCalls} (${zeroRate})`,
+		`Review Ratio         ${reviewRate} (${reviewCount}/${stats.total})`,
+		`Updates/Supersedes   ${updates}/${supersedes}`,
+		`Reverify             ${stats.revisionOps.reverify ?? 0}`,
+		`Memory Hints         shown ${stats.hintsShown} · followed ${stats.hintsFollowed}`,
 		`Cache Read Ratio     ${cacheRatio}`,
 		`Learning Tokens      ${formatTokens(stats.learning.input + stats.learning.output)} (今日 ${budget})`,
 		`Retrieval Tokens     ${stats.retrievalTokens}`,
@@ -87,8 +109,8 @@ export function formatStats(stats: ScopeStats, scopeName: string, repoName?: str
 	];
 	if (stats.lastLearningAt) lines.push(`Last Learning    ${stats.lastLearningAt}`);
 	if (stats.lastLearningError) lines.push(`Learning Error   ${stats.lastLearningError.slice(0, 300)}`);
-	if ((stats.byStatus.review ?? 0) > 0) {
-		lines.push("", "提示: review 状态的记忆关联文件已变更，检索时会降权并标记，需要复核。");
+	if (reviewCount > 0) {
+		lines.push("", "提示: review 状态的记忆证据文件已变化，检索时会降权；运行 /sm verify 重新核对。");
 	}
 	return lines.join("\n");
 }

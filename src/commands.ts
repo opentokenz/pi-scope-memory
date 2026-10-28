@@ -15,7 +15,7 @@ import {
 	type ScopeConfig,
 } from "./config.ts";
 import { backupDatabase, closeMemoryDb, openMemoryDb } from "./db.ts";
-import { clearMemories, previewClear, type ClearTarget } from "./memory.ts";
+import { checkFreshness, clearMemories, previewClear, type ClearTarget } from "./memory.ts";
 import {
 	detectGitRepos,
 	findScopeConflicts,
@@ -30,7 +30,7 @@ import {
 import { collectStats, formatStats } from "./stats.ts";
 import type { MemoryRuntime } from "./tools.ts";
 
-const SUBCOMMANDS = ["init", "recall", "clear", "stats", "model"] as const;
+const SUBCOMMANDS = ["init", "recall", "clear", "stats", "verify", "model"] as const;
 type Subcommand = (typeof SUBCOMMANDS)[number];
 
 export interface CommandDeps {
@@ -47,6 +47,7 @@ export function registerSmCommand({ pi, runtime }: CommandDeps): void {
 				{ value: "recall", label: "recall", description: "让 Agent 检索历史记忆" },
 				{ value: "clear", label: "clear", description: "预览或清理记忆 (--repo|--shared|--all, --yes)" },
 				{ value: "stats", label: "stats", description: "查看记忆、学习与缓存统计" },
+				{ value: "verify", label: "verify", description: "重新核对 review 记忆的证据文件" },
 				{ value: "model", label: "model", description: "查看或设置学习模型" },
 			];
 			const filtered = items.filter((item) => item.value.startsWith(prefix.trim()));
@@ -79,6 +80,9 @@ export function registerSmCommand({ pi, runtime }: CommandDeps): void {
 					case "stats":
 						await handleStats(runtime, ctx);
 						return;
+					case "verify":
+						handleVerify(runtime, ctx);
+						return;
 					case "model":
 						await handleModel(runtime, ctx, rest);
 						return;
@@ -98,6 +102,7 @@ function helpText(): string {
 		"/sm recall [主题]                           让 Agent 检索相关记忆",
 		"/sm clear --repo <repo>|--shared|--all [--yes]  预览或清理记忆",
 		"/sm stats                                  查看统计",
+		"/sm verify                                 重新核对 review 记忆的证据文件",
 		"/sm model                                   选择学习模型，随后选择思考强度",
 	].join("\n");
 }
@@ -376,6 +381,25 @@ async function handleStats(runtime: MemoryRuntime, ctx: ExtensionCommandContext)
 	}
 	const stats = collectStats(runtime.db, runtime.scope, runtime.defaults);
 	ctx.ui.notify(formatStats(stats, runtime.scope.scopeId, runtime.scope.repoId), "info");
+}
+
+function handleVerify(runtime: MemoryRuntime, ctx: ExtensionCommandContext): void {
+	if (!runtime.active || !runtime.db || !runtime.scope) {
+		ctx.ui.notify("当前目录未激活 pi-scope-memory。先执行 /sm init，然后 /reload。", "error");
+		return;
+	}
+	const result = checkFreshness(runtime.db, runtime.scope, 10_000);
+	if (result.checked === 0) {
+		ctx.ui.notify("没有需要复核的带证据记忆。", "info");
+		return;
+	}
+	ctx.ui.notify(
+		[
+			`复核完成: 检查 ${result.checked}`,
+			`标记 review ${result.flagged} · 恢复 active ${result.restored} · 过期 ${result.expired}`,
+		].join("\n"),
+		"info",
+	);
 }
 
 async function handleModel(

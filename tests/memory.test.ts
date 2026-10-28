@@ -6,11 +6,13 @@ import {
 	MemoryError,
 	checkFreshness,
 	clearMemories,
+	listRecentTitles,
 	previewClear,
 	saveMemory,
 	searchMemories,
 	type MemorySaveInput,
 } from "../src/memory.ts";
+import { collectStats, formatStats } from "../src/stats.ts";
 import { resolveScope, type ResolvedScope } from "../src/scope.ts";
 import type { MemoryConfig } from "../src/config.ts";
 import { cleanupTempDirs, makeConfig, makeRepos, tempRoot, useIsolatedHome, writeFile, scopeConfig } from "./helpers.ts";
@@ -143,6 +145,34 @@ test("保存前自动检索：重复内容更新原记忆而不是新增", () =>
 	}
 });
 
+test("长正文改写后仍能识别为同一记忆", () => {
+	const fx = fixture();
+	try {
+		const body =
+			"用户身份与子系统授权按企业范围校验：企业用户只能看到本企业数据，" +
+			"子系统超级管理员持有固定角色，可以跨企业维护基础数据。用户、企业和资质三类对象" +
+			"在服务层统一走权限校验，控制器只负责参数绑定。新增子系统时沿用同一套角色模型，" +
+			"不要另建一套身份表。注销使用 del_flag，停用和启用分别通知下游应用。";
+		const first = save(fx, fx.backend, {
+			kind: "decision",
+			title: "用户身份与子系统授权模型",
+			content: body,
+		});
+		const second = save(fx, fx.backend, {
+			kind: "decision",
+			title: "用户身份与子系统授权模型",
+			content: `${body} 前端只负责展示服务端返回的权限结果。`,
+		});
+		assert.equal(first.action, "created");
+		assert.equal(second.action, "updated");
+		assert.equal(second.id, first.id);
+		const count = fx.db.sqlite.prepare("SELECT count(*) AS n FROM memories").get();
+		assert.equal(Number(count?.n), 1);
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
 test("冲突内容自动替代旧记忆，历史版本可追溯", () => {
 	const fx = fixture();
 	try {
@@ -174,6 +204,79 @@ test("冲突内容自动替代旧记忆，历史版本可追溯", () => {
 			fx.config.defaults.retrieval,
 		);
 		assert.ok(historical.hits.some((hit) => hit.memory.id === old.id && hit.memory.status === "superseded"));
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+test("同标题的连续改写只更新一条记忆", () => {
+	const fx = fixture();
+	try {
+		const versions = [
+			"ERP 是企业档案与业务归属的权威来源；ERP 表与模型从 erp_merchant 改为 erp_tenant，未上线不做历史兼容。",
+			"ERP 是企业档案与业务归属的权威来源；ERP 表与模型从 erp_merchant 改为 erp_tenant，未上线不做历史兼容。企业以统一社会信用代码为唯一键。",
+			"ERP 是企业档案与业务归属的权威来源；ERP 表与模型从 erp_merchant 改为 erp_tenant，未上线不做历史兼容。企业以统一社会信用代码为唯一键，任何子系统都可以推送企业入驻。",
+			"ERP 是企业档案与业务归属的权威来源；ERP 表与模型从 erp_merchant 改为 erp_tenant，未上线不做历史兼容。企业以统一社会信用代码为唯一键，任何子系统都可以推送企业入驻，中台已有则复用。",
+			"ERP 是企业档案与业务归属的权威来源；ERP 表与模型从 erp_merchant 改为 erp_tenant，未上线不做历史兼容。企业以统一社会信用代码为唯一键，任何子系统都可以推送企业入驻，中台已有则复用、没有则保存。",
+			"ERP 是企业档案与业务归属的权威来源；ERP 表与模型从 erp_merchant 改为 erp_tenant，未上线不做历史兼容。企业以统一社会信用代码为唯一键，任何子系统都可以推送企业入驻，中台已有则复用、没有则保存；ERP 只在首次登记时推送。",
+			"ERP 是企业档案与业务归属的权威来源；ERP 表与模型从 erp_merchant 改为 erp_tenant，未上线不做历史兼容。企业以统一社会信用代码为唯一键，任何子系统都可以推送企业入驻，中台已有则复用、没有则保存；ERP 只在首次登记时推送，之后改名不传导。",
+		];
+		let firstId: string | undefined;
+		for (const [index, content] of versions.entries()) {
+			const result = save(fx, fx.backend, {
+				kind: "decision",
+				title: "企业/租户职责边界",
+				content,
+			});
+			if (index === 0) {
+				firstId = result.id;
+				assert.equal(result.action, "created");
+			} else {
+				assert.equal(result.action, "updated", `第 ${index + 1} 次改写应就地更新`);
+				assert.equal(result.id, firstId);
+			}
+		}
+
+		const counts = fx.db.sqlite
+			.prepare("SELECT status, count(*) AS n FROM memories GROUP BY status")
+			.all();
+		assert.deepEqual(
+			counts.map((row) => [String(row.status), Number(row.n)]),
+			[["active", 1]],
+		);
+		const revisions = fx.db.sqlite.prepare("SELECT count(*) AS n FROM memory_revisions").get();
+		assert.ok(Number(revisions?.n) >= versions.length, "每次改写都要留下 revision");
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+test("保存结果不再列出已被替代的历史版本", () => {
+	const fx = fixture();
+	try {
+		const old = save(fx, fx.backend, {
+			kind: "decision",
+			title: "Auth 存储方案",
+			content: "AuthService 使用 Redis 保存 Session。",
+		});
+		const replaced = save(fx, fx.backend, {
+			kind: "decision",
+			title: "Auth 存储方案",
+			content: "AuthService 已改为 JWT，并废弃 Redis Session。",
+		});
+		assert.equal(replaced.action, "superseded");
+		assert.equal(replaced.memory?.supersedes, old.id);
+
+		const next = save(fx, fx.backend, {
+			kind: "decision",
+			title: "Auth 存储方案",
+			content: "AuthService 使用 JWT，并废弃 Redis Session；旧客户端保留双读直到 V3。",
+		});
+		assert.ok(next.related.length > 0);
+		assert.ok(
+			next.related.every((item) => item.status !== "superseded"),
+			"related 不应再返回 superseded 的祖先版本",
+		);
 	} finally {
 		closeMemoryDb(fx.db);
 	}
@@ -294,6 +397,85 @@ test("跨仓库内容自动归入 Shared 层", () => {
 	}
 });
 
+test("证据未写 repo 时按唯一匹配推断仓库", () => {
+	const fx = fixture();
+	try {
+		const inferred = save(fx, fx.backend, {
+			kind: "fact",
+			layer: "shared",
+			title: "数据访问层使用 HikariCP",
+			content: "后端数据访问层统一使用 HikariCP。",
+			evidence: [{ path: "src/db.ts" }],
+		});
+		assert.equal(inferred.status, "active");
+		assert.equal(inferred.memory?.evidence[0]?.repo, "backend");
+		assert.ok(inferred.notes.some((note) => note.includes("推断证据仓库")));
+
+		writeFile(join(fx.root, "frontend"), "src/db.ts", "export const frontendDb = true;\n");
+		const ambiguous = save(fx, fx.backend, {
+			kind: "fact",
+			layer: "shared",
+			title: "两个仓库都有同名文件",
+			content: "两个仓库都存在 src/db.ts。",
+			evidence: [{ path: "src/db.ts" }],
+		});
+		assert.equal(ambiguous.status, "candidate");
+		assert.ok(ambiguous.notes.some((note) => note.includes("无法唯一推断")));
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+test("仓库根下多一层项目目录时证据路径仍能校验", () => {
+	const fx = fixture();
+	try {
+		writeFile(join(fx.root, "backend"), "backend/pom.xml", "<project/>\n");
+		writeFile(
+			join(fx.root, "backend"),
+			"backend/backend-admin/src/test/java/FooTest.java",
+			"class FooTest {}\n",
+		);
+		const result = save(fx, fx.backend, {
+			kind: "fact",
+			title: "集成测试位于内层项目的 admin 模块",
+			content: "集成测试 FooTest 位于 app 内层项目的 backend-admin 模块。",
+			evidence: [{ repo: "backend", path: "backend-admin/src/test/java/FooTest.java" }],
+		});
+		assert.equal(result.status, "active");
+		assert.equal(result.memory?.evidence[0]?.path, "backend/backend-admin/src/test/java/FooTest.java");
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+test("Scope 根目录保存仓库层记忆时从证据推断仓库", () => {
+	const fx = fixture();
+	try {
+		const rootScope = resolveScope(fx.config, fx.root);
+		assert.equal(rootScope.active, true);
+		if (!rootScope.active) throw new Error("scope resolution failed");
+		assert.equal(rootScope.resolved.repoId, undefined);
+
+		const result = saveMemory(
+			fx.db,
+			rootScope.resolved,
+			{
+				action: "upsert",
+				kind: "fact",
+				layer: "repo",
+				title: "数据访问层使用 HikariCP",
+				content: "后端数据访问层统一使用 HikariCP。",
+				evidence: [{ path: "src/db.ts" }],
+			},
+			fx.config.defaults.retrieval,
+		);
+		assert.equal(result.memory?.repoId, "backend");
+		assert.ok(result.notes.some((note) => note.includes("推断仓库 backend")));
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
 test("checkpoint 过期后默认不返回", () => {
 	const fx = fixture();
 	try {
@@ -304,6 +486,9 @@ test("checkpoint 过期后默认不返回", () => {
 		});
 		assert.equal(checkpoint.status, "active");
 		assert.ok(checkpoint.memory?.expiresAt);
+		const checkpointDays =
+			(Date.parse(String(checkpoint.memory?.expiresAt)) - Date.now()) / 86_400_000;
+		assert.ok(checkpointDays > 13.5 && checkpointDays < 14.5, "checkpoint 有效期保持 14 天");
 		fx.db.sqlite
 			.prepare("UPDATE memories SET expires_at = ? WHERE id = ?")
 			.run("2000-01-01T00:00:00.000Z", String(checkpoint.id));
@@ -326,7 +511,49 @@ test("checkpoint 过期后默认不返回", () => {
 	}
 });
 
-test("证据文件变化后记忆进入 review 并降权", () => {
+test("review 状态的 checkpoint 到期后也会过期", () => {
+	const fx = fixture();
+	try {
+		const checkpoint = save(fx, fx.backend, {
+			kind: "checkpoint",
+			title: "迁移进行中",
+			content: "后端迁移完成，前端尚未验收。",
+		});
+		fx.db.sqlite
+			.prepare("UPDATE memories SET status = 'review', expires_at = ? WHERE id = ?")
+			.run("2000-01-01T00:00:00.000Z", String(checkpoint.id));
+		const freshness = checkFreshness(fx.db, fx.backend);
+		assert.equal(freshness.expired, 1);
+		const row = fx.db.sqlite.prepare("SELECT status FROM memories WHERE id = ?").get(String(checkpoint.id));
+		assert.equal(String(row?.status), "expired");
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+test("目录证据不会被当成文件变化触发复核", () => {
+	const fx = fixture();
+	try {
+		const saved = save(fx, fx.backend, {
+			kind: "preference",
+			title: "刷新与目录约定",
+			content: "刷新逻辑放在 src/auth，配合同名测试文件。",
+			evidence: [
+				{ repo: "backend", path: "src/auth/refresh.ts" },
+				{ repo: "backend", path: "src/auth" },
+			],
+		});
+		assert.equal(saved.status, "active");
+		const freshness = checkFreshness(fx.db, fx.backend);
+		assert.equal(freshness.flagged, 0);
+		const row = fx.db.sqlite.prepare("SELECT status FROM memories WHERE id = ?").get(String(saved.id));
+		assert.equal(String(row?.status), "active");
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+test("关联文件的无关改动不会降级记忆", () => {
 	const fx = fixture();
 	try {
 		const saved = save(fx, fx.backend, {
@@ -336,15 +563,120 @@ test("证据文件变化后记忆进入 review 并降权", () => {
 			evidence: [{ repo: "backend", path: "src/auth/refresh.ts" }],
 		});
 		assert.equal(saved.status, "active");
-		writeFile(join(fx.root, "backend"), "src/auth/refresh.ts", "export function refresh(userId: string) {}\n");
+		writeFile(
+			join(fx.root, "backend"),
+			"src/auth/refresh.ts",
+			"// 补充注释\nexport function refresh(userId: string) {\n\treturn userId;\n}\n",
+		);
 		const freshness = checkFreshness(fx.db, fx.backend);
-		assert.equal(freshness.flagged, 1);
+		assert.equal(freshness.flagged, 0);
+		assert.equal(freshness.restored, 0);
 		const row = fx.db.sqlite.prepare("SELECT status FROM memories WHERE id = ?").get(String(saved.id));
-		assert.equal(String(row?.status), "review");
+		assert.equal(String(row?.status), "active", "锚点仍在时不应降为 review");
+		const revisions = fx.db.sqlite
+			.prepare("SELECT operation FROM memory_revisions WHERE memory_id = ?")
+			.all(String(saved.id));
+		assert.ok(revisions.some((item) => item.operation === "reverify"), "重新核对要留下 revision");
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
 
+test("旧记忆在文件未变时补写锚点", () => {
+	const fx = fixture();
+	try {
+		const saved = save(fx, fx.backend, {
+			kind: "fact",
+			title: "刷新函数签名",
+			content: "refresh() 返回 { token: string }。",
+			evidence: [{ repo: "backend", path: "src/auth/refresh.ts" }],
+		});
+		const id = String(saved.id);
+		const row = fx.db.sqlite.prepare("SELECT evidence_json FROM memories WHERE id = ?").get(id);
+		const withoutAnchors = (JSON.parse(String(row?.evidence_json)) as Record<string, unknown>[]).map(
+			({ anchors: _anchors, ...rest }) => rest,
+		);
+		fx.db.sqlite
+			.prepare("UPDATE memories SET evidence_json = ? WHERE id = ?")
+			.run(JSON.stringify(withoutAnchors), id);
+
+		const freshness = checkFreshness(fx.db, fx.backend);
+		assert.equal(freshness.flagged, 0);
+		const after = fx.db.sqlite.prepare("SELECT evidence_json, status FROM memories WHERE id = ?").get(id);
+		const evidence = JSON.parse(String(after?.evidence_json)) as { anchors?: string[] }[];
+		assert.ok(evidence[0]?.anchors?.includes("refresh"), "未变文件应补写锚点");
+		assert.equal(String(after?.status), "active");
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+test("引用的符号被删除后进入 review，恢复后自动回到 active", () => {
+	const fx = fixture();
+	try {
+		const saved = save(fx, fx.backend, {
+			kind: "fact",
+			title: "刷新函数签名",
+			content: "refresh() 返回 { token: string }。",
+			evidence: [{ repo: "backend", path: "src/auth/refresh.ts" }],
+		});
+		assert.equal(saved.status, "active");
+
+		writeFile(join(fx.root, "backend"), "src/auth/refresh.ts", "export function renew() {}\n");
+		const flagged = checkFreshness(fx.db, fx.backend);
+		assert.equal(flagged.flagged, 1);
+		const reviewRow = fx.db.sqlite.prepare("SELECT status FROM memories WHERE id = ?").get(String(saved.id));
+		assert.equal(String(reviewRow?.status), "review");
 		const hits = searchMemories(fx.db, fx.backend, { query: "refresh" }, fx.config.defaults.retrieval);
 		assert.equal(hits.hits.length, 1);
 		assert.equal(hits.hits[0]?.memory.status, "review");
+
+		writeFile(join(fx.root, "backend"), "src/auth/refresh.ts", "export function refresh() {}\n");
+		const restored = checkFreshness(fx.db, fx.backend);
+		assert.equal(restored.restored, 1);
+		const activeRow = fx.db.sqlite.prepare("SELECT status FROM memories WHERE id = ?").get(String(saved.id));
+		assert.equal(String(activeRow?.status), "active", "证据恢复后应自动恢复 active");
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+test("学习标题列表包含 review 记忆", () => {
+	const fx = fixture();
+	try {
+		save(fx, fx.backend, {
+			kind: "fact",
+			title: "Backend 连接池",
+			content: "Backend 使用 HikariCP。",
+			evidence: [{ repo: "backend", path: "src/db.ts" }],
+		});
+		fx.db.sqlite.prepare("UPDATE memories SET status = 'review'").run();
+		const titles = listRecentTitles(fx.db, fx.backend);
+		assert.equal(titles.length, 1);
+		assert.equal(titles[0]?.status, "review");
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+test("零命中检索与 review 比例出现在统计里", () => {
+	const fx = fixture();
+	try {
+		save(fx, fx.backend, {
+			kind: "fact",
+			title: "Backend 连接池",
+			content: "Backend 使用 HikariCP。",
+			evidence: [{ repo: "backend", path: "src/db.ts" }],
+		});
+		const miss = searchMemories(fx.db, fx.backend, { query: "订单号生成规则" }, fx.config.defaults.retrieval);
+		assert.equal(miss.hits.length, 0);
+		const stats = collectStats(fx.db, fx.backend, fx.config.defaults);
+		assert.equal(stats.searchCalls, 1);
+		assert.equal(stats.searchZeroCalls, 1);
+		const text = formatStats(stats, "enterprise");
+		assert.match(text, /Zero-hit Searches\s+1\/1 \(100%\)/);
+		assert.match(text, /Review Ratio\s+0% \(0\/1\)/);
+		assert.match(text, /Updates\/Supersedes\s+0\/0/);
 	} finally {
 		closeMemoryDb(fx.db);
 	}

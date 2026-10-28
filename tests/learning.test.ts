@@ -11,7 +11,7 @@ import {
 	runLearningBatch,
 	shouldLearn,
 } from "../src/learning.ts";
-import { searchMemories } from "../src/memory.ts";
+import { saveMemory, searchMemories } from "../src/memory.ts";
 import { recordLearningUsage } from "../src/stats.ts";
 import { resolveScope, type ResolvedScope } from "../src/scope.ts";
 import type { DefaultsConfig, MemoryConfig } from "../src/config.ts";
@@ -54,6 +54,7 @@ function toolResult(overrides: Partial<ToolResultEvent> & { toolName: string }):
 interface CapturedRequest {
 	reasoning?: unknown;
 	systemPrompt?: string;
+	prompt?: string;
 }
 
 function fakeContext(
@@ -68,9 +69,14 @@ function fakeContext(
 		model: { provider: "anthropic", id: "test-model", reasoning: true },
 		thinkingLevel,
 		modelRegistry: {
-			streamSimple: (_model: unknown, context: { systemPrompt?: string }, options?: { reasoning?: unknown }) => {
+			streamSimple: (
+				_model: unknown,
+				context: { systemPrompt?: string; messages?: { content?: { text?: string }[] }[] },
+				options?: { reasoning?: unknown },
+			) => {
 				captured.reasoning = options?.reasoning;
 				captured.systemPrompt = context.systemPrompt;
+				captured.prompt = context.messages?.[0]?.content?.[0]?.text;
 				return { result: respond };
 			},
 			find: (provider: string, id: string) => ({ provider, id, reasoning: true }),
@@ -276,6 +282,69 @@ test("学习提示词可在全局配置中定制，并始终追加 JSON 输出�
 	}
 });
 
+test("学习提示词列出仓库挂载布局并区分改写与替代", async () => {
+	const fx = fixture();
+	try {
+		captureToolResult(
+			fx.db,
+			"s",
+			toolResult({ toolName: "write", toolCallId: "l1", input: { path: "src/a.ts" } }),
+		);
+		const captured: CapturedRequest = {};
+		await runLearningBatch(fakeContext("[]", captured), {
+			db: fx.db,
+			scope: fx.scope,
+			defaults: fx.config.defaults,
+			prompts: {},
+			sessionId: "s",
+		});
+		assert.match(captured.prompt ?? "", /可用仓库（证据路径必须相对于仓库根目录）/);
+		assert.match(captured.prompt ?? "", /- backend: backend/);
+		assert.match(captured.prompt ?? "", /- frontend: frontend/);
+		assert.match(captured.prompt ?? "", /backend\/backend/);
+		assert.match(captured.prompt ?? "", /同一结论的补充或改写/);
+		assert.match(captured.systemPrompt ?? "", /项目子目录/);
+		assert.match(captured.systemPrompt ?? "", /不要用 replaces/);
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+test("学习提示词会标注已有记忆的 review 状态", async () => {
+	const fx = fixture();
+	try {
+		saveMemory(
+			fx.db,
+			fx.scope,
+			{
+				action: "upsert",
+				kind: "fact",
+				title: "刷新函数签名",
+				content: "refresh() 返回 { token: string }。",
+				evidence: [{ repo: "backend", path: "src/auth/refresh.ts" }],
+			},
+			fx.config.defaults.retrieval,
+		);
+		fx.db.sqlite.prepare("UPDATE memories SET status = 'review'").run();
+		captureToolResult(
+			fx.db,
+			"s",
+			toolResult({ toolName: "write", toolCallId: "r1", input: { path: "src/a.ts" } }),
+		);
+		const captured: CapturedRequest = {};
+		await runLearningBatch(fakeContext("[]", captured), {
+			db: fx.db,
+			scope: fx.scope,
+			defaults: fx.config.defaults,
+			prompts: {},
+			sessionId: "s",
+		});
+		assert.match(captured.prompt ?? "", /\[backend\|review\]/);
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
 test("学习输出解析容忍代码块与无效字段", () => {
 	const parsed = extractCandidates(
 		[
@@ -361,6 +430,35 @@ test("学习批次写入记忆、记录用量并清空待处理事件", async ()
 		const hits = searchMemories(fx.db, fx.scope, { query: "singleflight" }, fx.config.defaults.retrieval);
 		assert.equal(hits.hits.length, 1);
 		assert.equal(hits.hits[0]?.memory.status, "active");
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+test("一次学习最多保存一条 checkpoint", async () => {
+	const fx = fixture();
+	try {
+		captureToolResult(
+			fx.db,
+			"s",
+			toolResult({ toolName: "write", toolCallId: "c1", input: { path: "src/a.ts" } }),
+		);
+		const reply = JSON.stringify([
+			{ kind: "checkpoint", title: "阶段一完成", content: "后端改造完成，等待验收。" },
+			{ kind: "checkpoint", title: "阶段二完成", content: "前端改造完成，等待验收。" },
+		]);
+		const outcome = await runLearningBatch(fakeContext(reply), {
+			db: fx.db,
+			scope: fx.scope,
+			defaults: fx.config.defaults,
+			prompts: {},
+			sessionId: "s",
+		});
+		assert.equal(outcome.status, "ok");
+		assert.equal(outcome.created, 1);
+		assert.equal(outcome.skipped, 1);
+		const count = fx.db.sqlite.prepare("SELECT count(*) AS n FROM memories WHERE kind = 'checkpoint'").get();
+		assert.equal(Number(count?.n), 1);
 	} finally {
 		closeMemoryDb(fx.db);
 	}

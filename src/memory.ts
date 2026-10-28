@@ -1,5 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { join } from "node:path";
 import type { RetrievalConfig } from "./config.ts";
 import { incrementMeta, nowIso, withTransaction, type MemoryDb } from "./db.ts";
 import { repoAbsolutePath, repoRef, type ResolvedScope } from "./scope.ts";
@@ -24,6 +25,8 @@ export interface MemoryEvidence {
 	verifiedAt?: string;
 	/** Content hash (or size/mtime fingerprint) captured at verification time. */
 	hash?: string;
+	/** Distinctive terms found in the cited file when it was verified. */
+	anchors?: string[];
 	/** Set when the file changed after verification. */
 	stale?: boolean;
 }
@@ -125,6 +128,8 @@ const MAX_TITLE_CHARS = 100;
 const CHECKPOINT_TTL_DAYS = 14;
 const MAX_EVIDENCE_ITEMS = 12;
 const CANDIDATE_LIMIT = 500;
+/** Same-title rewrites below this similarity are treated as a new version, not an in-place update. */
+const CONFLICT_SIMILARITY = 0.6;
 
 const STOP_WORDS = new Set([
 	"the",
@@ -152,6 +157,7 @@ const STOP_WORDS = new Set([
 	"can",
 	"has",
 	"have",
+	"or",
 ]);
 
 const SUPERSEDE_SIGNAL =
@@ -177,7 +183,7 @@ const KIND_WEIGHT: Record<MemoryKind, number> = {
 const STATUS_WEIGHT: Record<MemoryStatus, number> = {
 	active: 1,
 	candidate: 0.86,
-	review: 0.72,
+	review: 0.9,
 	superseded: 0.45,
 	expired: 0.4,
 };
@@ -251,7 +257,10 @@ export function searchMemories(
 		usedTokens += cost;
 	}
 
-	if (query !== "" && options.trackCall !== false) incrementMeta(db, "search_calls");
+	if (query !== "" && options.trackCall !== false) {
+		incrementMeta(db, "search_calls");
+		if (budgeted.length === 0) incrementMeta(db, "search_zero");
+	}
 
 	return { hits: budgeted, candidates: hits.length };
 }
@@ -261,7 +270,7 @@ export function getMemory(db: MemoryDb, id: string): MemoryRecord | undefined {
 	return row ? rowToMemory(row) : undefined;
 }
 
-/** Memories that could be duplicates or outdated versions of a new memory. */
+/** Active-base memories that could be duplicates or conflicting versions of a new memory. */
 export function findRelatedMemories(
 	db: MemoryDb,
 	scope: ResolvedScope,
@@ -277,7 +286,6 @@ export function findRelatedMemories(
 			query,
 			target: input.repoId === null ? "shared" : "current",
 			repo: input.repoId ?? undefined,
-			includeHistorical: true,
 			limit: 10,
 			trackCall: false,
 		},
@@ -299,7 +307,7 @@ export function findRelatedMemories(
 		const relation: RelatedRelation = !sameKind
 			? "related"
 			: sameTitle
-				? supersedeSignal
+				? supersedeSignal && similarity < CONFLICT_SIMILARITY
 					? "conflict"
 					: "duplicate"
 				: similarity >= 0.82
@@ -350,7 +358,7 @@ export function saveMemory(
 	const { repoId, notes } = resolveLayer(scope, input, content);
 	const title = deriveTitle(input.title, content);
 	assertNoSecrets(title);
-	const evidenceResult = validateEvidence(scope, repoId, input.evidence ?? []);
+	const evidenceResult = validateEvidence(scope, repoId, input.evidence ?? [], `${title}\n${content}`);
 	notes.push(...evidenceResult.notes);
 
 	if (input.action === "supersede" && !input.memoryId) {
@@ -374,12 +382,18 @@ export function saveMemory(
 	const layerMatches = related.filter(
 		(candidate) => candidate.layer === (repoId === null ? "shared" : "repo") && candidate.repoId === repoId,
 	);
-	// "Same title + a change statement" is a replacement, not an update, even
-	// though the dedupe key matches.
+	const exactSimilarity = exactDuplicate ? similarityTo(title, content, exactDuplicate) : 0;
+	// "Same title + a change statement" is a replacement only when the body
+	// actually changed enough. A refinement that keeps most of the old wording
+	// updates the existing row instead of leaving a chain of superseded copies.
 	const conflict =
 		layerMatches.find((candidate) => candidate.relation === "conflict") ??
-		(exactDuplicate && SUPERSEDE_SIGNAL.test(content)
-			? ({ ...(toRelated(exactDuplicate) as RelatedMemory), relation: "conflict" as const })
+		(exactDuplicate && SUPERSEDE_SIGNAL.test(content) && exactSimilarity < CONFLICT_SIMILARITY
+			? {
+					...(toRelated(exactDuplicate) as RelatedMemory),
+					similarity: exactSimilarity,
+					relation: "conflict" as const,
+				}
 			: undefined);
 	const duplicate = conflict
 		? undefined
@@ -563,63 +577,159 @@ function invalidateMemory(
 	});
 }
 
-/** Expire stale checkpoints and flag memories whose evidence files changed. */
+/** Expire stale checkpoints and re-check memories whose evidence files changed. */
 export function checkFreshness(db: MemoryDb, scope: ResolvedScope, limit = 40): {
 	expired: number;
 	checked: number;
 	flagged: number;
+	restored: number;
 } {
 	const now = nowIso();
 	const expired = db.sqlite
 		.prepare(
-			"UPDATE memories SET status = 'expired', updated_at = ? WHERE kind = 'checkpoint' AND status IN ('active','candidate') AND expires_at IS NOT NULL AND expires_at < ?",
+			"UPDATE memories SET status = 'expired', updated_at = ? WHERE kind = 'checkpoint' AND status IN ('active','candidate','review') AND expires_at IS NOT NULL AND expires_at < ?",
 		)
 		.run(now, now);
 
 	const rows = db.sqlite
 		.prepare(
-			"SELECT * FROM memories WHERE status = 'active' AND evidence_json != '[]' AND verified_at IS NOT NULL ORDER BY verified_at ASC LIMIT ?",
+			"SELECT * FROM memories WHERE status IN ('active','review') AND evidence_json != '[]' AND verified_at IS NOT NULL ORDER BY verified_at ASC LIMIT ?",
 		)
 		.all(limit);
 
 	let flagged = 0;
+	let restored = 0;
 	for (const row of rows) {
 		const memory = rowToMemory(row);
 		if (memory.evidence.length === 0) continue;
+		const memoryText = `${memory.title}\n${memory.content}`;
 		const refreshed: MemoryEvidence[] = [];
-		let changed = false;
+		let evidenceChanged = false;
+		let anchorsAdded = false;
+		let stale = false;
 		for (const item of memory.evidence) {
 			if (!item.repo || !item.path) {
 				refreshed.push(item);
 				continue;
 			}
 			const abs = repoAbsolutePath(scope, item.repo, item.path);
-			if (!abs) {
-				refreshed.push({ ...item, stale: true });
-				changed = true;
+			if (!abs || !item.hash) {
+				// Directories and never-verified paths have no hash to compare. Freshness
+				// cannot judge them, so leave them exactly as the save path left them.
+				refreshed.push(item);
 				continue;
 			}
 			const current = hashPath(abs);
-			if (item.hash && current && item.hash !== current) {
+			if (!current) {
 				refreshed.push({ ...item, stale: true });
-				changed = true;
+				stale = true;
+				continue;
+			}
+			if (item.hash !== current) {
+				evidenceChanged = true;
+				if (anchorsHold(abs, item.anchors)) {
+					refreshed.push({ ...item, hash: current, stale: false });
+				} else {
+					refreshed.push({ ...item, stale: true });
+					stale = true;
+				}
 			} else {
-				refreshed.push({ ...item, hash: current ?? item.hash });
+				const next = { ...item, hash: current, stale: false };
+				// Memories verified before anchors existed get them backfilled from
+				// the unchanged file, so the next edit can be judged precisely.
+				if (!item.anchors || item.anchors.length === 0) {
+					const anchors = evidenceAnchors(abs, memoryText);
+					if (anchors.length > 0) {
+						next.anchors = anchors;
+						anchorsAdded = true;
+					}
+				}
+				refreshed.push(next);
 			}
 		}
-		if (!changed) continue;
-		flagged += 1;
-		incrementMeta(db, "verification_failures");
-		const updatedEvidence = JSON.stringify(refreshed);
-		const updated = bumpRev(db, memory.id, {
-			status: "review",
-			evidenceJson: updatedEvidence,
-			updatedAt: nowIso(),
-		});
-		recordRevision(db, memory.id, "stale", updated);
+
+		if (stale) {
+			if (memory.status === "active") {
+				flagged += 1;
+				incrementMeta(db, "verification_failures");
+			}
+			const updated = bumpRev(db, memory.id, {
+				status: "review",
+				evidenceJson: JSON.stringify(refreshed),
+				updatedAt: now,
+			});
+			recordRevision(db, memory.id, "stale", updated);
+			continue;
+		}
+
+		if (memory.status === "review") {
+			restored += 1;
+			const updated = bumpRev(db, memory.id, {
+				status: "active",
+				evidenceJson: JSON.stringify(refreshed),
+				verifiedAt: now,
+				updatedAt: now,
+			});
+			recordRevision(db, memory.id, "reverify", updated);
+			continue;
+		}
+
+		if (evidenceChanged || anchorsAdded) {
+			const updated = bumpRev(db, memory.id, {
+				evidenceJson: JSON.stringify(refreshed),
+				verifiedAt: now,
+				updatedAt: now,
+			});
+			recordRevision(db, memory.id, "reverify", updated);
+		}
 	}
 
-	return { expired: Number(expired.changes), checked: rows.length, flagged };
+	return { expired: Number(expired.changes), checked: rows.length, flagged, restored };
+}
+
+/**
+ * A cited file that still contains the terms the memory was built from is not
+ * enough to prove the whole claim, but it is enough to keep the memory active
+ * after an unrelated edit. A renamed symbol or a deleted section removes the
+ * anchor and sends the memory to review.
+ */
+function anchorsHold(abs: string, anchors: string[] | undefined): boolean {
+	if (!anchors || anchors.length === 0) return false;
+	const text = readTextFile(abs);
+	if (text === undefined) return false;
+	const haystack = text.toLowerCase();
+	return anchors.every((anchor) => haystack.includes(anchor));
+}
+
+/** Distinctive terms from the memory text that also occurred in the cited file. */
+function evidenceAnchors(abs: string, memoryText: string): string[] {
+	const text = readTextFile(abs);
+	if (text === undefined) return [];
+	const haystack = text.toLowerCase();
+	const found = new Set<string>();
+	for (const token of tokenize(memoryText)) {
+		if (!isSpecificToken(token) || STOP_WORDS.has(token)) continue;
+		if (haystack.includes(token)) found.add(token);
+	}
+	for (const run of memoryText.toLowerCase().match(/[\u3400-\u9fff]{4,}/g) ?? []) {
+		for (let index = 0; index + 4 <= run.length; index += 1) {
+			const phrase = run.slice(index, index + 4);
+			if (haystack.includes(phrase)) found.add(phrase);
+		}
+	}
+	return [...found].sort((a, b) => b.length - a.length).slice(0, 6);
+}
+
+function readTextFile(abs: string): string | undefined {
+	try {
+		const stat = statSync(abs);
+		if (!stat.isFile() || stat.size > 2 * 1024 * 1024) return undefined;
+		const buffer = readFileSync(abs);
+		if (buffer.includes(0)) return undefined;
+		return buffer.toString("utf8");
+	} catch {
+		return undefined;
+	}
 }
 
 export function previewClear(db: MemoryDb, scope: ResolvedScope, target: ClearTarget): ClearPreview {
@@ -693,7 +803,11 @@ export function countMemories(db: MemoryDb, scope: ResolvedScope): {
 	return { total, byLayer, byStatus };
 }
 
-export function listRecentTitles(db: MemoryDb, scope: ResolvedScope, limit = 30): { id: string; title: string; repoId: string | null }[] {
+export function listRecentTitles(
+	db: MemoryDb,
+	scope: ResolvedScope,
+	limit = 30,
+): { id: string; title: string; repoId: string | null; status: MemoryStatus }[] {
 	const registered = scope.repos.map((repo) => repo.id);
 	const scopeSql =
 		registered.length === 0
@@ -701,14 +815,52 @@ export function listRecentTitles(db: MemoryDb, scope: ResolvedScope, limit = 30)
 			: `(repo_id IS NULL OR repo_id IN (${registered.map(() => "?").join(",")}))`;
 	const rows = db.sqlite
 		.prepare(
-			`SELECT id, title, repo_id FROM memories WHERE ${scopeSql} AND status IN ('active','candidate') ORDER BY updated_at DESC LIMIT ?`,
+			`SELECT id, title, repo_id, status FROM memories WHERE ${scopeSql} AND status IN ('active','candidate','review') ORDER BY updated_at DESC LIMIT ?`,
 		)
 		.all(...registered, limit);
 	return rows.map((row) => ({
 		id: String(row.id),
 		title: String(row.title),
 		repoId: row.repo_id === null ? null : String(row.repo_id),
+		status: String(row.status) as MemoryStatus,
 	}));
+}
+
+/** Memories whose evidence covers a repository-relative file or directory path. */
+export function memoriesForPath(
+	db: MemoryDb,
+	scope: ResolvedScope,
+	repoId: string,
+	relPath: string,
+	limit = 4,
+): MemoryRecord[] {
+	const registered = scope.repos.map((repo) => repo.id);
+	const cleaned = relPath.replaceAll("\\", "/").replace(/^\.\//, "");
+	if (registered.length === 0 || cleaned === "") return [];
+	const scopeSql = `(repo_id IS NULL OR repo_id IN (${registered.map(() => "?").join(",")}))`;
+	const rows = db.sqlite
+		.prepare(
+			`SELECT * FROM memories WHERE status IN ('active','review','candidate') AND ${scopeSql} ORDER BY updated_at DESC LIMIT 2000`,
+		)
+		.all(...registered);
+	const hits: MemoryRecord[] = [];
+	for (const row of rows) {
+		const memory = rowToMemory(row);
+		const matched = memory.evidence.some((item) => {
+			if (item.repo !== repoId || !item.path) return false;
+			return item.path === cleaned || cleaned.startsWith(`${item.path}/`);
+		});
+		if (matched) hits.push(memory);
+	}
+	const rank: Record<MemoryStatus, number> = {
+		active: 0,
+		review: 1,
+		candidate: 2,
+		superseded: 3,
+		expired: 4,
+	};
+	hits.sort((a, b) => rank[a.status] - rank[b.status] || b.updatedAt.localeCompare(a.updatedAt));
+	return hits.slice(0, limit);
 }
 
 export function pendingObservations(db: MemoryDb): number {
@@ -828,23 +980,70 @@ function scoreMemory(
 	const tokens = new Set(tokenize(`${memory.title}\n${memory.content}\n${memory.tags.join(" ")}`));
 	const overlap = jaccard(queryTokens, tokens);
 	const coverage = coverageOf(queryTokens, tokens);
+	const queryTokenList = [...queryTokens];
+	const matchedTokens = queryTokenList.filter((token) => tokens.has(token));
+	const strongMatch = matchedTokens.some(isSpecificToken);
+	const weakMatches = matchedTokens.filter((token) => !isSpecificToken(token)).length;
 	const haystack = normalizeText(`${memory.title}\n${memory.content}\n${memory.relatedPaths.join(" ")}`);
 	const substringBonus = normalizedQuery.length >= 2 && haystack.includes(normalizedQuery) ? 0.9 : 0;
-	const queryTokenList = [...queryTokens];
+	const phraseBonus = hasSharedPhrase(normalizedQuery, haystack) ? 0.35 : 0;
 	const pathBonus = memory.relatedPaths.some((path) =>
-		queryTokenList.some((token) => path.toLowerCase().includes(token)),
+		queryTokenList.some((token) => isSpecificToken(token) && pathMatchesToken(path, token)),
 	)
 		? 0.25
 		: 0;
 	const ageDays = Math.max(0, (Date.now() - Date.parse(memory.updatedAt)) / 86_400_000);
 	const recency = Math.max(0, 1 - ageDays / 365) * 0.05;
-	const relevant = matchedBy === "fts" || overlap > 0 || substringBonus > 0 || pathBonus > 0;
+	// A shared token proves nothing on its own: generic Chinese bigrams such as
+	// "规则" or "测试" appear in unrelated memories. Require a distinctive token,
+	// or several weaker ones with enough query coverage. Short queries (one or two
+	// terms) still match on a single shared term, which is what the user asked for.
+	const relevant =
+		substringBonus > 0 ||
+		phraseBonus > 0 ||
+		pathBonus > 0 ||
+		strongMatch ||
+		(queryTokens.size <= 2 && matchedTokens.length > 0) ||
+		(weakMatches >= 2 && coverage >= (queryTokens.size >= 4 ? 0.3 : 0.5));
 	const score =
-		(base + overlap * 1.4 + coverage * 0.8 + substringBonus + pathBonus) *
+		(base + overlap * 1.4 + coverage * 0.8 + substringBonus + phraseBonus + pathBonus) *
 			STATUS_WEIGHT[memory.status] *
 			KIND_WEIGHT[memory.kind] +
 		recency;
 	return { score, relevant };
+}
+
+/**
+ * A token specific enough to match on its own: identifiers and 3+ char CJK runs.
+ * Numeric-only tokens ("10", "192") match dates and versions in evidence paths
+ * and must not count as a keyword hit.
+ */
+function isSpecificToken(token: string): boolean {
+	return [...token].length >= 3 && /[a-z\u3400-\u9fff]/i.test(token);
+}
+
+function pathMatchesToken(path: string, token: string): boolean {
+	const lower = token.toLowerCase();
+	const cjk = /[\u3400-\u9fff]/.test(token);
+	for (const segment of path.toLowerCase().split(/[^a-z0-9\u3400-\u9fff]+/)) {
+		if (segment === "") continue;
+		if (cjk ? segment.includes(lower) : segment === lower || segment.startsWith(lower)) return true;
+	}
+	return false;
+}
+
+/**
+ * A shared 4-char Chinese phrase ("结构变更脚本") is specific enough to justify
+ * a hit; 2-char bigrams are not. This keeps sentence-style queries working
+ * without letting "数据库" or "配置" match on their own.
+ */
+function hasSharedPhrase(normalizedQuery: string, haystack: string): boolean {
+	for (const run of normalizedQuery.match(/[\u3400-\u9fff]{4,}/g) ?? []) {
+		for (let index = 0; index + 4 <= run.length; index += 1) {
+			if (haystack.includes(run.slice(index, index + 4))) return true;
+		}
+	}
+	return false;
 }
 
 function buildFtsQuery(query: string): string {
@@ -853,13 +1052,17 @@ function buildFtsQuery(query: string): string {
 	for (const match of lower.matchAll(/[a-z0-9][a-z0-9_.\-/]*[a-z0-9]|[a-z0-9]/g)) {
 		const word = match[0];
 		for (const part of word.split(/[._\-/]+/)) {
-			if (part.length >= 2 && !STOP_WORDS.has(part)) terms.add(`"${part}"`);
+			// The trigram tokenizer needs at least three characters per term;
+			// two-letter abbreviations still work through runSubstring's LIKE path.
+			if (part.length >= 3 && !STOP_WORDS.has(part)) terms.add(`"${part}"`);
 		}
 	}
 	for (const run of lower.match(/[\u3400-\u9fff]+/g) ?? []) {
-		if (run.length >= 2) terms.add(`${run}*`);
+		for (let index = 0; index + 3 <= run.length; index += 1) {
+			terms.add(`"${run.slice(index, index + 3)}"`);
+		}
 	}
-	return [...terms].slice(0, 12).join(" OR ");
+	return [...terms].slice(0, 32).join(" OR ");
 }
 
 function decideStatus(kind: MemoryKind, verifiedCount: number, source: MemorySource): MemoryStatus {
@@ -885,9 +1088,18 @@ function resolveLayer(
 		return { repoId: null, notes };
 	}
 	if (input.layer === "repo") {
-		const repoId = explicitRepo || scope.repoId;
-		if (!repoId) throw new MemoryError("layer=repo 需要当前目录属于一个已注册仓库，或显式提供 repo");
+		const repoId =
+			explicitRepo ||
+			scope.repoId ||
+			inferRepoFromEvidence(scope, input.evidence) ||
+			inferMentionedRepo(scope, `${input.title ?? ""} ${content}`);
+		if (!repoId) {
+			throw new MemoryError(
+				`layer=repo 需要当前目录属于已注册仓库，或显式提供 repo。可用仓库: ${formatRepoRoots(scope)}`,
+			);
+		}
 		if (!repoRef(scope, repoId)) throw new MemoryError(`未知仓库: ${repoId}`);
+		if (!explicitRepo && repoId !== scope.repoId) notes.push(`根据证据路径或内容推断仓库 ${repoId}`);
 		return { repoId, notes };
 	}
 
@@ -923,6 +1135,7 @@ function validateEvidence(
 	scope: ResolvedScope,
 	layerRepoId: string | null,
 	evidence: MemoryEvidence[],
+	memoryText: string,
 ): { items: MemoryEvidence[]; verifiedCount: number; notes: string[] } {
 	const notes: string[] = [];
 	const items: MemoryEvidence[] = [];
@@ -930,7 +1143,7 @@ function validateEvidence(
 	const now = nowIso();
 
 	for (const raw of evidence.slice(0, MAX_EVIDENCE_ITEMS)) {
-		const repo = raw.repo?.trim() || layerRepoId || undefined;
+		let repo = raw.repo?.trim() || layerRepoId || undefined;
 		const path = raw.path?.trim().replaceAll("\\", "/").replace(/^\.\//, "");
 		if (!path) {
 			if (raw.commit || raw.branch || raw.reason) {
@@ -949,8 +1162,13 @@ function validateEvidence(
 			continue;
 		}
 		if (!repo) {
-			notes.push(`证据缺少仓库归属，已忽略: ${path}`);
-			continue;
+			const inferred = inferEvidenceRepo(scope, path);
+			if (!inferred) {
+				notes.push(`证据缺少仓库归属，且无法唯一推断: ${path}`);
+				continue;
+			}
+			repo = inferred.repoId;
+			notes.push(`根据路径推断证据仓库: ${inferred.repoId} (${inferred.rel})`);
 		}
 		if (!repoRef(scope, repo)) {
 			notes.push(`证据引用了未注册仓库 ${repo}，已忽略: ${path}`);
@@ -964,6 +1182,7 @@ function validateEvidence(
 		const verified = resolved.hash !== undefined;
 		if (!verified) notes.push(`证据文件不存在: ${repo}/${path}`);
 		if (verified) verifiedCount += 1;
+		const anchors = verified ? evidenceAnchors(resolved.abs, memoryText) : [];
 		items.push({
 			repo,
 			path: resolved.rel,
@@ -973,6 +1192,7 @@ function validateEvidence(
 			verified,
 			verifiedAt: now,
 			hash: resolved.hash,
+			anchors: anchors.length > 0 ? anchors : undefined,
 		});
 	}
 
@@ -1105,6 +1325,16 @@ function toRelated(memory: MemoryRecord | undefined): RelatedMemory | undefined 
 	};
 }
 
+function similarityTo(title: string, content: string, memory: MemoryRecord): number {
+	return round(
+		jaccard(
+			tokenize(`${title}\n${content}`),
+			tokenize(`${memory.title}\n${memory.content}`),
+		),
+		3,
+	);
+}
+
 function recordRevision(db: MemoryDb, memoryId: string, operation: string, memory: MemoryRecord): void {
 	db.sqlite
 		.prepare("INSERT INTO memory_revisions (memory_id, operation, snapshot_json, created_at) VALUES (?, ?, ?, ?)")
@@ -1208,7 +1438,10 @@ function firstLine(content: string): string {
 
 function buildSnippet(content: string): string {
 	const collapsed = content.replace(/\s+/g, " ").trim();
-	return collapsed.length > 200 ? `${collapsed.slice(0, 199)}…` : collapsed;
+	// 200 chars cut off the decisive constraint in longer memories and the agent
+	// has no way to read the rest. The token budget in searchMemories still caps
+	// how many hits are returned.
+	return collapsed.length > 600 ? `${collapsed.slice(0, 599)}…` : collapsed;
 }
 
 function assertNoSecrets(text: string): void {
@@ -1262,7 +1495,79 @@ function resolveEvidencePath(
 		if (hash !== undefined) return { rel: variant, abs, hash };
 		missing ??= { rel: variant, abs };
 	}
+	// Multi-repo workspaces often wrap the real project one level down:
+	// repo root app contains app/, services/cloud/.
+	// If the model omitted that layer, try it, but only when exactly one nested
+	// project contains the path so a wrong match cannot silently verify.
+	const nested: { rel: string; abs: string; hash: string }[] = [];
+	for (const child of nestedProjectDirs(repo.abs)) {
+		const variant = `${child}/${path}`;
+		const abs = repoAbsolutePath(scope, repoId, variant);
+		if (!abs) continue;
+		const hash = hashPath(abs);
+		if (hash !== undefined) nested.push({ rel: variant, abs, hash });
+	}
+	if (nested.length === 1) return nested[0];
 	return missing;
+}
+
+const PROJECT_MARKERS = ["pom.xml", "package.json", "go.mod", "Cargo.toml", "pyproject.toml", ".git"];
+
+function nestedProjectDirs(repoAbs: string): string[] {
+	let entries;
+	try {
+		entries = readdirSync(repoAbs, { withFileTypes: true });
+	} catch {
+		return [];
+	}
+	const found: string[] = [];
+	for (const entry of entries) {
+		if (!entry.isDirectory() || entry.name.startsWith(".") || entry.name === "node_modules") continue;
+		const child = join(repoAbs, entry.name);
+		if (PROJECT_MARKERS.some((marker) => existsSync(join(child, marker)))) found.push(entry.name);
+	}
+	return found.sort();
+}
+
+/** Resolve an evidence path without an explicit repo when exactly one repo contains it. */
+function inferEvidenceRepo(
+	scope: ResolvedScope,
+	path: string,
+): { repoId: string; rel: string } | undefined {
+	const matches: { repoId: string; rel: string }[] = [];
+	for (const repo of scope.repos) {
+		const resolved = resolveEvidencePath(scope, repo.id, path);
+		if (resolved?.hash !== undefined) matches.push({ repoId: repo.id, rel: resolved.rel });
+	}
+	return matches.length === 1 ? matches[0] : undefined;
+}
+
+function inferRepoFromEvidence(
+	scope: ResolvedScope,
+	evidence: MemoryEvidence[] | undefined,
+): string | undefined {
+	if (!evidence) return undefined;
+	const found = new Set<string>();
+	for (const item of evidence) {
+		if (item.repo && repoRef(scope, item.repo)) {
+			found.add(item.repo);
+			continue;
+		}
+		const path = item.path?.trim().replaceAll("\\", "/").replace(/^\.\//, "");
+		if (!path) continue;
+		const inferred = inferEvidenceRepo(scope, path);
+		if (inferred) found.add(inferred.repoId);
+	}
+	return found.size === 1 ? [...found][0] : undefined;
+}
+
+function inferMentionedRepo(scope: ResolvedScope, text: string): string | undefined {
+	const found = mentionedRepos(text, scope);
+	return found.length === 1 ? found[0] : undefined;
+}
+
+function formatRepoRoots(scope: ResolvedScope): string {
+	return scope.repos.map((repo) => `${repo.id} (${repo.rel})`).join(", ") || "(无)";
 }
 
 function hashPath(path: string): string | undefined {

@@ -53,6 +53,7 @@ pi-scope-memory 把“工程记忆”从对话历史里拆出来：
 - **Scope 感知**：一个 Scope 管理多个仓库，Shared 层跨仓库共享，仓库层默认隔离。
 - **默认关闭**：没有配置、未初始化或不在允许目录时，完全像没装扩展一样运行。
 - **按需检索**：两个固定工具，不在每轮请求中注入记忆，不动态改写工具声明。
+- **路径提示**：Agent 首次读取或编辑被记忆引用的文件时，在工具结果末尾追加一次标题级提示；每路径一次，每会话最多 3 次。
 - **证据驱动**：实现事实需要真实文件证据；无证据的知识保存为未验证候选。
 - **写入前检索**：新增记忆前先查同层历史，自动更新重复项、替代冲突项或跳过已有 Shared 结论。
 - **自动学习**：轻量事件采集加批量 LLM 提炼，支持独立模型、思考强度、每日预算和失败重试。
@@ -129,12 +130,15 @@ cd ~/Projects/enterprise
 | `/sm init [--name <scope>] [--repos a,b,c]` | 初始化并启用当前目录 Scope |
 | `/sm recall [主题]` | 让 Agent 调用 `scope_memory_search` 检索历史记忆 |
 | `/sm clear --repo <repo> \| --shared \| --all [--yes]` | 预览或清理记忆 |
-| `/sm stats` | 记忆、检索、缓存、学习与成本统计 |
+| `/sm stats` | 记忆、检索、零命中率、review 比例、路径提示、学习与成本统计 |
+| `/sm verify` | 重新核对 review 记忆的证据锚点，能恢复的恢复为 active |
 | `/sm model` | 打开模型选择器，选完后继续选择思考强度 |
 
 `/sm init` 不做交互菜单，但会校验真实路径、Scope ID 和仓库路径；发现重叠或冲突时直接报错，不会猜测要覆盖哪个 Scope。以后新增仓库必须显式执行 `/sm init --repos <name>`。
 
 `/sm clear` 不带 `--yes` 时只显示将删除的数量。带 `--yes` 时先用 `VACUUM INTO` 生成一致性备份，再删除目标范围内的记忆、历史版本和 FTS 索引；`--all` 只作用于当前 Scope，并额外清理待处理事件。Scope 配置和 `usage_stats` 不会被清理。
+
+证据文件变化时不再一律降为 `review`：保存时会把记忆里的特征词（标识符和四字中文短语）与证据文件实际内容比对，只记录确实出现过的锚点。文件改动后锚点仍在就更新哈希并保持 `active`，锚点消失或文件被删除才进入 `review`；文件恢复后下一次复核会自动回到 `active`。`/sm verify` 可以立即执行一次全量复核。
 
 `/sm model` 在 TUI 和 RPC 模式下打开选择器，不需要输入模型 ID；非交互模式退化为文本列表。`/sm model --thinking` 单独选择思考强度，也支持显式写法：
 
@@ -202,7 +206,7 @@ Agent 调用这两个工具时，TUI 或 RPC 客户端会收到一条临时通�
 - `current`（默认）：Shared + 当前仓库。root 模式下等价于整个 Scope。
 - `shared`：仅 Shared；`all`：整个 Scope；`repo`：指定仓库 + Shared。
 - 默认不返回 `superseded` / `expired`；`includeHistorical: true` 全部返回。
-- 返回短摘要、状态和证据路径，受 `retrieval.maxTokens` 限制。
+- 返回正文摘要（最多 600 字）、状态和证据路径，受 `retrieval.maxTokens` 限制；没有相关命中时返回空结果，不用最近记忆填充。
 
 ### `scope_memory_save`
 
@@ -229,11 +233,11 @@ Agent 调用这两个工具时，TUI 或 RPC 客户端会收到一条临时通�
 保存流程固定为：范围校验 → 证据校验 → 搜索同层历史记忆 → 判定重复/冲突 → 在一个事务里写入或失效 → 记录 revision。
 
 - 同标题同类型的普通补充：更新原记忆，不新增条目。
-- 同标题且出现“改为 / 不再 / 迁移 / 废弃”等替代语义，或内容高度重合但结论冲突：新建记忆并把旧记忆标记 `superseded`。
+- 同标题且出现“改为 / 不再 / 迁移 / 废弃”等替代语义时，只有正文与原记忆相似度低于 0.6 才新建并标记 `superseded`；相似度较高的补充或改写直接更新原记忆。
 - Shared 层已有等价记忆时，仓库层保存会被跳过并说明原因。
 - `invalidate` 只失效指定记忆，不创建替代项。
 - 没有可验证证据的 `fact` 会保存为 `candidate`，检索时标注未验证；`decision`、`constraint`、`preference`、`checkpoint` 属于知识或状态，不需要代码证据。
-- 证据路径限定在已注册仓库内，逃逸路径、未注册仓库、敏感文件会被丢弃并写入说明。
+- 证据路径限定在已注册仓库内，逃逸路径、未注册仓库、敏感文件会被丢弃并写入说明；未写 `repo` 时按唯一匹配的仓库推断，仓库根下多一层项目目录时会尝试唯一的嵌套路径。
 - 内容疑似包含密钥或凭据时直接拒绝。
 - 检索结果是数据而不是指令；工具描述明确要求先与当前代码核对。
 
@@ -355,26 +359,28 @@ Collector 只记录有价值的事件指针，不保存原始输出和源码：
 | --- | --- |
 | `active` | 已验证或无需代码证据，可正常检索 |
 | `candidate` | 缺少可验证证据，检索时标注未验证 |
-| `review` | 关联文件已变化，检索时降权并提示复核 |
+| `review` | 证据文件变化且锚点已消失，检索时降权并提示复核 |
 | `superseded` | 已被新结论替代，仅历史检索可见 |
 | `expired` | checkpoint 超过有效期，默认不返回 |
 
 - 每次保存写入 `memory_revisions`，记录操作与完整快照。
-- 每条证据保存路径哈希与可选的 commit / branch；会话启动时（每小时最多一次）检查关联文件是否变化，变化的事实型记忆进入 `review`。
+- 每条证据保存路径哈希、特征词锚点与可选的 commit / branch；会话启动时（每小时最多一次）检查关联文件是否变化。文件改动但锚点仍在时保持 `active` 并更新哈希，锚点消失才进入 `review`。
 - `checkpoint` 有 14 天有效期，过期自动变 `expired`。
-- 重新保存并带有效证据后，记忆会恢复为 `active`。
+- 文件恢复或重新保存并带有效证据后，记忆会恢复为 `active`；也可以用 `/sm verify` 立即复核。
 
 ## 检索与召回
 
 检索管线是 SQLite FTS5 加路径与符号匹配，没有 Embedding 依赖：
 
 1. 按 Scope 与仓库过滤。
-2. FTS5 负责英文标识符和中文前缀。
-3. `LIKE` 子串与 JS 端 token 重合度覆盖中文任意子串。
+2. FTS5 使用 trigram 分词，覆盖英文标识符和中文任意子串；两个字的短查询继续用 `LIKE` 兜底。
+3. `LIKE` 子串与 JS 端 token 重合度补充排序信号，并过滤只有泛化二元词命中的结果。
 4. 按状态、类型、路径命中和更新时间加权。
 5. 按 `retrieval.maxTokens` 截断返回内容。
 
 `/sm recall` 不会在命令内部强制检索，而是发送一条新的用户消息，要求 Agent 调用 `scope_memory_search`，并说明当前 Scope、可用仓库和核对要求。检索到的历史记忆始终被视为数据，不获得指令权限。
+
+当 Agent 首次 `read` / `edit` / `write` 一个被记忆证据引用的文件时，工具结果末尾会追加一段标题级提示（记忆 id、层级、类型、状态和标题）。它每个路径每会话只出现一次，每会话最多 3 次，没有相关记忆时没有开销；提示不包含正文，也不改写 System Prompt，正文仍需用 `scope_memory_search` 获取。
 
 ## Prompt Cache
 
@@ -382,7 +388,7 @@ Collector 只记录有价值的事件指针，不保存原始输出和源码：
 | --- | --- |
 | 未激活目录 | 不注册工具、不读数据库、不调用模型 |
 | 工具声明 | 随 Scope 在 `session_start` 固定，运行中不增删 |
-| 记忆注入 | 只通过工具按需返回 |
+| 记忆注入 | 工具按需返回；首次触及被引用文件时的一次性路径提示 |
 | `/sm recall` | 发送新的用户消息，不改写 System Prompt |
 | 原生 Compaction | 不修改 |
 | `/sm stats` | 展示 cache read / write、未缓存输入与学习成本 |
@@ -399,7 +405,7 @@ Cache Read Ratio = cacheRead / (input + cacheRead + cacheWrite)
 
 - SQLite WAL、`busy_timeout=5000`、短事务，每个 Pi 进程独立连接。
 - 更新带 `rev` 乐观锁，冲突时返回可重试错误，不覆盖其他进程的修改。
-- 清理前用 `VACUUM INTO` 生成一致性备份，不在 WAL 活跃时复制单个数据库文件。
+- 清理前用 `VACUUM INTO` 生成一致性备份，不在 WAL 活跃时复制单个数据库文件；schema 升级（例如 v1 到 v2 的 trigram 索引重建）前同样先备份。
 - 工具和命令都校验当前 Scope；`repo` 参数不能访问其他 Scope 或未注册仓库。
 - 默认不保存原始凭据、`.env`、私钥或完整终端输出；敏感内容直接拒绝写入。
 - 数据库损坏或学习失败不会阻止主 Agent 继续工作；待处理事件持久化，下次启动可恢复。
@@ -425,7 +431,7 @@ memory_revisions    变更历史与快照
 observations        待提炼的事件队列（attempts 控制重试）
 usage_stats         session / learning / retrieval 用量
 meta                计数器与运行时状态
-memory_fts          FTS5 索引，触发器与 memories 同步
+memory_fts          FTS5 trigram 索引，触发器与 memories 同步
 ```
 
 Shared 与仓库层在同一个库里用 `repo_id` 区分，`NULL` 表示 Shared。

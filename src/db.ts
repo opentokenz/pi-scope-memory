@@ -5,7 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { backupPath, databasePath, scopeDataDir } from "./config.ts";
 
 /** Bump together with the DDL below; `PRAGMA user_version` stores it. */
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 export interface MemoryDb {
 	scopeId: string;
@@ -129,11 +129,40 @@ function migrate(db: MemoryDb): void {
 		throw new Error(`数据库 schema 版本 ${current} 高于当前扩展支持的 ${SCHEMA_VERSION}`);
 	}
 	if (current === 0) {
+		// DDL_V1 still creates the original FTS table; migrateFtsToTrigram
+		// immediately replaces it with the trigram index used from version 2 on.
 		db.sqlite.exec(DDL_V1);
+		db.sqlite.exec("PRAGMA user_version = 1");
+		migrateFtsToTrigram(db);
+		db.sqlite.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
+		return;
+	}
+	if (current === 1) {
+		// Rebuilding the search index is not destructive, but keep the same
+		// backup guarantee as any other migration.
+		backupDatabase(db);
+		migrateFtsToTrigram(db);
 		db.sqlite.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
 		return;
 	}
 	throw new Error(`未知的数据库 schema 版本: ${current}`);
+}
+
+/**
+ * Version 2 switches FTS5 to the trigram tokenizer so long Chinese sentences
+ * match without word segmentation. The old triggers stay in place: they are
+ * attached to `memories` and only refer to the `memory_fts` table by name.
+ */
+function migrateFtsToTrigram(db: MemoryDb): void {
+	db.sqlite.exec("DROP TABLE IF EXISTS memory_fts");
+	db.sqlite.exec(`CREATE VIRTUAL TABLE memory_fts USING fts5(
+  title,
+  content,
+  content='memories',
+  content_rowid='rowid',
+  tokenize='trigram'
+)`);
+	db.sqlite.exec("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')");
 }
 
 const DDL_V1 = `
