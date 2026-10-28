@@ -1,6 +1,7 @@
 import { basename } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { Api, Model } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, getSupportedThinkingLevels } from "@earendil-works/pi-ai";
 import {
 	LEARNING_THINKING_LEVELS,
 	emptyConfig,
@@ -412,7 +413,11 @@ async function handleModel(
 		}
 		// Selecting a model and then its reasoning effort is one decision; ask
 		// for the effort right away instead of requiring a second command.
-		const pickedThinking = await pickThinkingLevel(ctx, config.defaults.learningThinkingLevel);
+		const pickedThinking = await pickThinkingLevel(
+			ctx,
+			config.defaults.learningThinkingLevel,
+			config.defaults.learningModel,
+		);
 		if (pickedThinking === undefined) {
 			applied.notes.push(
 				`学习思考强度保持 ${config.defaults.learningThinkingLevel}（已取消选择）`,
@@ -420,7 +425,7 @@ async function handleModel(
 		} else {
 			config.defaults.learningThinkingLevel = pickedThinking;
 			applied.notes.push(
-				`学习思考强度: ${pickedThinking}${describeThinkingSupport(ctx, config.defaults.learningModel)}`,
+				`学习思考强度: ${pickedThinking}${describeThinkingSupport(ctx, config)}`,
 			);
 		}
 		persistModelConfig(runtime, config);
@@ -433,7 +438,11 @@ async function handleModel(
 			ctx.ui.notify(thinkingListing(ctx, config), "info");
 			return;
 		}
-		const picked = await pickThinkingLevel(ctx, config.defaults.learningThinkingLevel);
+		const picked = await pickThinkingLevel(
+			ctx,
+			config.defaults.learningThinkingLevel,
+			config.defaults.learningModel,
+		);
 		if (picked === undefined) {
 			ctx.ui.notify("已取消，思考强度未修改。", "info");
 			return;
@@ -441,7 +450,7 @@ async function handleModel(
 		config.defaults.learningThinkingLevel = picked;
 		persistModelConfig(runtime, config);
 		ctx.ui.notify(
-			`学习思考强度: ${picked}${describeThinkingSupport(ctx, config.defaults.learningModel)}`,
+			`学习思考强度: ${picked}${describeThinkingSupport(ctx, config)}`,
 			"info",
 		);
 		return;
@@ -467,7 +476,7 @@ async function handleModel(
 		}
 		config.defaults.learningThinkingLevel = explicitThinking as LearningThinkingLevel;
 		notes.push(
-			`学习思考强度: ${explicitThinking}${describeThinkingSupport(ctx, config.defaults.learningModel)}`,
+			`学习思考强度: ${explicitThinking}${describeThinkingSupport(ctx, config)}`,
 		);
 	}
 
@@ -565,15 +574,22 @@ function modelEntries(ctx: ExtensionCommandContext, config: MemoryConfig): Selec
 async function pickThinkingLevel(
 	ctx: ExtensionCommandContext,
 	current: LearningThinkingLevel,
+	reference: string,
 ): Promise<LearningThinkingLevel | undefined> {
-	const entries = thinkingEntries(ctx, current);
+	const entries = thinkingEntries(ctx, current, reference);
 	const choice = await ctx.ui.select("选择学习思考强度", entries.map((entry) => entry.label));
 	if (choice === undefined) return undefined;
 	return entries.find((entry) => entry.label === choice)?.value as LearningThinkingLevel | undefined;
 }
 
-function thinkingEntries(ctx: ExtensionCommandContext, current: LearningThinkingLevel): SelectorEntry[] {
+function thinkingEntries(
+	ctx: ExtensionCommandContext,
+	current: LearningThinkingLevel,
+	reference: string,
+): SelectorEntry[] {
 	const sessionLevel = ctx.thinkingLevel;
+	const model = learningModelFor(ctx, reference);
+	const supported = model ? getSupportedThinkingLevels(model) : undefined;
 	const descriptions: Record<LearningThinkingLevel, string> = {
 		inherit: `跟随当前会话${sessionLevel ? ` (${sessionLevel})` : ""}`,
 		off: "不发送 reasoning",
@@ -584,21 +600,35 @@ function thinkingEntries(ctx: ExtensionCommandContext, current: LearningThinking
 		xhigh: "很高强度",
 		max: "最高强度",
 	};
-	return LEARNING_THINKING_LEVELS.map((level) => ({
-		label: `${level} — ${descriptions[level]}${level === current ? "  [当前]" : ""}`,
-		value: level,
-	}));
+	const entries: SelectorEntry[] = [];
+	for (const level of LEARNING_THINKING_LEVELS) {
+		// inherit and off are policies rather than concrete efforts: inherit follows the
+		// session and off sends no reasoning at all. Both stay selectable for any model.
+		const policy = level === "inherit" || level === "off";
+		const isCurrent = level === current;
+		if (!policy && !isCurrent && supported && !supported.includes(level)) continue;
+		const fallback = effectiveThinkingLevel(model, level);
+		const note = fallback === undefined ? "" : `（模型不支持，实际按 ${fallback} 运行）`;
+		entries.push({
+			label: `${level} — ${descriptions[level]}${note}${isCurrent ? "  [当前]" : ""}`,
+			value: level,
+		});
+	}
+	return entries;
 }
 
 function modelListing(ctx: ExtensionCommandContext, config: MemoryConfig): string {
 	const available = availableModels(ctx, 30);
 	return [
 		`学习模型: ${config.defaults.learningModel}`,
-		`学习思考强度: ${config.defaults.learningThinkingLevel}${describeThinkingSupport(ctx, config.defaults.learningModel)}`,
+		`学习思考强度: ${config.defaults.learningThinkingLevel}${describeThinkingSupport(ctx, config)}`,
 		"",
 		"交互模式下直接运行 /sm model 选择模型，随后选择思考强度；/sm model --thinking 只调整强度。",
 		"也支持显式输入: /sm model current | <provider/model-id> [--thinking <level>]。",
-		`可用强度: ${LEARNING_THINKING_LEVELS.join(" | ")}`,
+		"可用强度:",
+		...thinkingEntries(ctx, config.defaults.learningThinkingLevel, config.defaults.learningModel).map(
+			(entry) => `  ${entry.label}`,
+		),
 		"",
 		"可用模型:",
 		...available.map((entry) => `${entry === config.defaults.learningModel ? "*" : " "} ${entry}`),
@@ -606,24 +636,43 @@ function modelListing(ctx: ExtensionCommandContext, config: MemoryConfig): strin
 }
 
 function thinkingListing(ctx: ExtensionCommandContext, config: MemoryConfig): string {
+	const levels = thinkingEntries(ctx, config.defaults.learningThinkingLevel, config.defaults.learningModel).map(
+		(entry) => entry.value,
+	);
 	return [
-		`学习思考强度: ${config.defaults.learningThinkingLevel}`,
+		`学习思考强度: ${config.defaults.learningThinkingLevel}${describeThinkingSupport(ctx, config)}`,
 		"",
 		"交互模式下直接运行 /sm model --thinking 打开选择器；",
-		`也支持: /sm model --thinking <level>，可用 ${LEARNING_THINKING_LEVELS.join(" | ")}。`,
+		`也支持: /sm model --thinking <level>，当前模型可选项 ${levels.join(" | ")}。`,
 		"inherit 跟随当前会话；off 不发送 reasoning；其余为固定强度。",
 	].join("\n");
 }
 
-function describeThinkingSupport(ctx: ExtensionCommandContext, reference: string): string {
-	if (reference === "current") {
-		return ctx.model?.reasoning === false ? "（当前模型未声明 reasoning）" : "";
-	}
-	const slash = reference.indexOf("/");
-	if (slash <= 0) return "";
-	const model = ctx.modelRegistry.find(reference.slice(0, slash), reference.slice(slash + 1));
+function describeThinkingSupport(ctx: ExtensionCommandContext, config: MemoryConfig): string {
+	const model = learningModelFor(ctx, config.defaults.learningModel);
 	if (!model) return "";
-	return model.reasoning ? "（模型支持 reasoning）" : "（模型未声明 reasoning）";
+	if (!model.reasoning) return "（模型未声明 reasoning）";
+	const fallback = effectiveThinkingLevel(model, config.defaults.learningThinkingLevel);
+	if (fallback !== undefined) return `（模型不支持 ${config.defaults.learningThinkingLevel}，实际按 ${fallback} 运行）`;
+	return "（模型支持 reasoning）";
+}
+
+/** The level that will really be sent, when it differs from the requested one. */
+function effectiveThinkingLevel(
+	model: Model<Api> | undefined,
+	level: LearningThinkingLevel,
+): string | undefined {
+	if (!model || !model.reasoning || level === "inherit" || level === "off") return undefined;
+	if (getSupportedThinkingLevels(model).includes(level)) return undefined;
+	return clampThinkingLevel(model, level);
+}
+
+/** The model the learning pass will call, or undefined when it cannot be resolved. */
+function learningModelFor(ctx: ExtensionCommandContext, reference: string): Model<Api> | undefined {
+	if (reference === "current" || reference.trim() === "") return ctx.model as Model<Api> | undefined;
+	const slash = reference.indexOf("/");
+	if (slash <= 0 || slash === reference.length - 1) return undefined;
+	return ctx.modelRegistry.find(reference.slice(0, slash), reference.slice(slash + 1)) as Model<Api> | undefined;
 }
 
 function availableModels(ctx: ExtensionCommandContext, limit: number): string[] {

@@ -65,6 +65,19 @@ function harness(notices: string[] = [], sent: string[] = []): Harness {
 	};
 }
 
+/** Model shape the command layer reads: reasoning capability plus per-level support. */
+function fakeModel(provider: string, id: string): Record<string, unknown> {
+	return {
+		provider,
+		id,
+		reasoning: true,
+		// Shaped like deepseek-v4.1-flash: medium and xhigh are unsupported.
+		...(provider === "openai"
+			? { thinkingLevelMap: { low: "low", high: "high", max: "max", medium: null, xhigh: null } }
+			: {}),
+	};
+}
+
 function makeCtx(
 	cwd: string,
 	notices: string[],
@@ -82,20 +95,17 @@ function makeCtx(
 		hasUI: options.hasUI === true,
 		signal: undefined,
 		sessionManager: { getSessionId: () => options.sessionId ?? "session-1" },
-		model: { provider: "anthropic", id: "test-model" },
+		model: fakeModel("anthropic", "test-model"),
 		modelRegistry: {
 			complete: options.complete ?? (async () => assistantMessage("[]")),
-			find: (provider: string, id: string) => (provider === "nope" ? undefined : { provider, id }),
+			find: (provider: string, id: string) => (provider === "nope" ? undefined : fakeModel(provider, id)),
 			hasConfiguredAuth: () => true,
 			streamSimple:
 				options.streamSimple ??
 				((_model: unknown, _context: unknown, _options: unknown) => ({
 					result: async () => assistantMessage("[]"),
 				})),
-			getAvailable: () => [
-				{ provider: "anthropic", id: "test-model" },
-				{ provider: "openai", id: "gpt-x" },
-			],
+			getAvailable: () => [fakeModel("anthropic", "test-model"), fakeModel("openai", "gpt-x")],
 		},
 		thinkingLevel: "medium",
 		ui: {
@@ -372,6 +382,54 @@ test("/sm model 在交互模式下先选模型，再选思考强度", async () =
 	assert.ok(notices.some((notice) => notice.includes("已取消")));
 	const afterCancel = loadConfig();
 	if (afterCancel.status === "loaded") assert.equal(afterCancel.config.defaults.learningModel, "anthropic/test-model");
+	await h.shutdown();
+});
+
+test("思考强度选择器只展示模型支持的等级", async () => {
+	const { base } = enterpriseSetup();
+	const notices: string[] = [];
+	const h = harness(notices);
+	const command = h.commands.get("sm");
+	assert.ok(command);
+
+	const offered: string[][] = [];
+	const ctx = makeCtx(base, notices, {
+		hasUI: true,
+		select: async (title, items) => {
+			if (title.includes("选择学习模型")) return items.find((item) => item.startsWith("openai/gpt-x"));
+			offered.push(items);
+			return items.find((item) => item.startsWith("high"));
+		},
+	});
+	await command.handler("model", ctx as unknown as ExtensionCommandContext);
+
+	const levels = (offered[0] ?? []).map((item) => item.split(" — ")[0] ?? "");
+	assert.ok(levels.includes("inherit"), "inherit 是策略而不是具体强度，必须保留");
+	assert.ok(levels.includes("off"));
+	assert.ok(levels.includes("high"));
+	assert.ok(!levels.includes("medium"), "模型把 medium 映射为 null，不应出现在选择器里");
+	assert.ok(!levels.includes("xhigh"));
+
+	// 显式写入一个不受支持的强度仍然允许，但必须提示实际生效值。
+	await command.handler("model openai/gpt-x medium", ctx as unknown as ExtensionCommandContext);
+	assert.ok(
+		notices.some((notice) => notice.includes("模型不支持 medium，实际按 high 运行")),
+		`应提示实际强度，实际输出: ${notices.join(" / ")}`,
+	);
+
+	// 当前强度不受支持时，选择器仍要展示它，并标注实际生效值。
+	const current: string[][] = [];
+	const thinkingCtx = makeCtx(base, notices, {
+		hasUI: true,
+		select: async (_title, items) => {
+			current.push(items);
+			return undefined;
+		},
+	});
+	await command.handler("model --thinking", thinkingCtx as unknown as ExtensionCommandContext);
+	const marked = (current[0] ?? []).find((item) => item.startsWith("medium"));
+	assert.ok(marked, "当前强度必须出现在选择器里");
+	assert.match(marked ?? "", /实际按 high 运行/);
 	await h.shutdown();
 });
 
