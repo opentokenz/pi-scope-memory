@@ -9,7 +9,7 @@
 
 > **English overview**
 >
-> pi-scope-memory gives the Pi coding agent durable, scope-aware project memory. A scope groups one or more Git repositories under a root directory. Cross-repository knowledge goes to a shared layer; repository-specific knowledge stays isolated. Two on-demand tools search and save memories, so nothing is injected into every turn and the prompt prefix stays stable. Every write first searches existing memories and updates, supersedes or skips them; implementation facts require verified file evidence. A background learner distils tool events with a configurable model and reasoning effort. Storage is one SQLite + FTS5 database per scope.
+> pi-scope-memory gives the Pi coding agent durable, scope-aware project memory. A scope groups one or more Git repositories under a root directory. Cross-repository knowledge goes to a shared layer; repository-specific knowledge stays isolated. Two on-demand tools search and save memories. Each session also carries one short memory brief, built once at `session_start` and kept byte-stable, so nothing is injected per turn and the prompt prefix stays stable. Every write first searches existing memories and updates, supersedes or skips them; implementation facts require verified file evidence. A background learner distils tool events with a configurable model and reasoning effort. Storage is one SQLite + FTS5 database per scope.
 
 **状态**：`0.1.0`，早期版本。配置格式与工具参数可能在小版本内调整。
 
@@ -133,7 +133,7 @@ cd ~/Projects/enterprise
 | `/sm learn [提炼重点]` | 立即从当前会话上下文提炼记忆，参数只用于指定提炼重点 |
 | `/sm recall [主题]` | 让 Agent 调用 `scope_memory_search` 检索历史记忆 |
 | `/sm clear --repo <repo> \| --shared \| --all [--yes]` | 预览或清理记忆 |
-| `/sm stats` | 记忆、检索、零命中率、review 比例、路径提示、学习与成本统计 |
+| `/sm stats` | 记忆、检索、零命中率、review 比例、命中覆盖与从未命中数、路径提示、学习与成本统计 |
 | `/sm verify` | 重新核对 review 记忆的证据锚点，能恢复的恢复为 active |
 | `/sm model` | 打开模型选择器，选完后继续选择思考强度 |
 
@@ -268,6 +268,10 @@ Agent 调用这两个工具时，TUI 或 RPC 客户端会收到一条临时通�
     "cache": {
       "dynamicInjection": false,
       "trackUsage": true
+    },
+    "brief": {
+      "enabled": true,
+      "maxChars": 2000
     }
   },
   "prompts": {},
@@ -393,6 +397,7 @@ Collector 只记录有价值的事件指针，不保存原始输出和源码：
 
 检索管线是 SQLite FTS5 加路径与符号匹配，没有 Embedding 依赖：
 
+0. **路径型 query 走证据匹配**。查询看起来是仓库路径时（带 `/`，且能对应到某个仓库），先按 `evidence_json` 做结构化匹配，命中的记忆置顶，再用全文检索补位。路径很可能不出现在标题和正文里，全文检索只能靠巧合命中；在真实会话的 78 个路径查询上，这一步把 P@5 从 25.7% 提到 47.2%，R@5 从 47.8% 提到 88.5%，且不增加任何 token。
 1. 按 Scope 与仓库过滤。
 2. FTS5 使用 trigram 分词，覆盖英文标识符和中文任意子串；两个字的短查询继续用 `LIKE` 兜底。
 3. `LIKE` 子串与 JS 端 token 重合度补充排序信号，并过滤只有泛化二元词命中的结果。
@@ -401,7 +406,15 @@ Collector 只记录有价值的事件指针，不保存原始输出和源码：
 
 `/sm recall` 不会在命令内部强制检索，而是发送一条新的用户消息，要求 Agent 调用 `scope_memory_search`，并说明当前 Scope、可用仓库和核对要求。检索到的历史记忆始终被视为数据，不获得指令权限。
 
-当 Agent 首次 `read` / `edit` / `write` 一个被记忆证据引用的文件时，工具结果末尾会追加一段标题级提示（记忆 id、层级、类型、状态和标题）。它每个路径每会话只出现一次，每会话最多 3 次，没有相关记忆时没有开销；提示不包含正文，也不改写 System Prompt，正文仍需用 `scope_memory_search` 获取。
+当 Agent 首次 `read` / `edit` / `write` 一个被记忆证据引用的文件，或 `bash` 命令里出现了这样的路径时，工具结果末尾会追加一次提示：记忆 id、层级、类型、状态、标题，以及前三条记忆的正文（单条提示约 600 token 预算）。每个路径每会话只出现一次，每会话 5,000 token 的提示预算（硬上限 30 次），没有相关记忆时没有开销。两个细节都是为了把同一份额度换成更多信息：提示会跳过本会话已经触达过的记忆（包括之前检索返回过的）；可直接照抄的 `scope_memory_search` 调用只出现在首个提示里——重复二十次等于把 1/5 的预算花在同一句话上。实测这两项把单会话触达条数从 17 提到 34，token 不变。提示不写入 System Prompt，也不做每轮注入，所以前缀缓存仍然稳定。
+
+直接给正文是有意为之：只给标题的版本在三个真实 Scope 里累计提示 28 次、被跟进 0 次，把正文留在第二次调用之后，等于把最贵的一步交给一个不会被执行的决策。bash 路径提取是启发式的：跟随每段命令的 `cd`，忽略 glob、赋值和重定向，只用来判断命令是否提到了被证据引用的文件，不解析命令语义。
+
+### 会话快照
+
+路径提示依赖“碰到被引用的文件”，而很多会话在碰到任何相关文件之前就已经做出了决定。所以每个会话还会在 `session_start` 生成一份快照，写入 system prompt 的 `memory-brief` section：作用域概览、记忆状态计数，以及按类型优先级（constraint → pitfall → decision → preference，再按命中次数和更新时间）选出的常驻条目，整体不超过 `defaults.brief.maxChars`（默认 2000 字符）。只保留约束和踩坑的原因是：偏好错过一次只是多读几行代码，禁令错过一次就是错误的行为。
+
+快照只在会话启动时构建一次，之后每轮原样附加。Pi 对 prompt section 按内容 diff，内容不变就不下发补丁，因此同一会话内不会产生缓存失效；写入新记忆**不会**刷新快照，因为那等于重写整个前缀。没有记忆、未激活目录或 `defaults.brief.enabled = false` 时不注入任何内容。
 
 ## Prompt Cache
 
@@ -409,7 +422,8 @@ Collector 只记录有价值的事件指针，不保存原始输出和源码：
 | --- | --- |
 | 未激活目录 | 不注册工具、不读数据库、不调用模型 |
 | 工具声明 | 随 Scope 在 `session_start` 固定，运行中不增删 |
-| 记忆注入 | 工具按需返回；首次触及被引用文件时的一次性路径提示 |
+| 会话快照 | `session_start` 生成一次（≤ `defaults.brief.maxChars`，默认 2000 字符），写入固定 section；Pi 按内容 diff，同一会话内字节不变，后续轮次不产生补丁 |
+| 记忆注入 | 工具按需返回；首次触及被引用文件（含 bash 命令）时的一次性路径提示，直接带正文 |
 | `/sm recall` | 发送新的用户消息，不改写 System Prompt |
 | `/sm learn` | 独立模型调用，不改写会话上下文与 System Prompt |
 | 原生 Compaction | 不修改 |
@@ -427,7 +441,7 @@ Cache Read Ratio = cacheRead / (input + cacheRead + cacheWrite)
 
 - SQLite WAL、`busy_timeout=5000`、短事务，每个 Pi 进程独立连接。
 - 更新带 `rev` 乐观锁，冲突时返回可重试错误，不覆盖其他进程的修改。
-- 清理前用 `VACUUM INTO` 生成一致性备份，不在 WAL 活跃时复制单个数据库文件；schema 升级（例如 v1 到 v2 的 trigram 索引重建）前同样先备份。
+- 清理前用 `VACUUM INTO` 生成一致性备份，不在 WAL 活跃时复制单个数据库文件；schema 升级（v1 到 v2 的 trigram 索引重建、v2 到 v3 的命中追踪字段）前同样先备份。
 - 工具和命令都校验当前 Scope；`repo` 参数不能访问其他 Scope 或未注册仓库。
 - 默认不保存原始凭据、`.env`、私钥或完整终端输出；敏感内容直接拒绝写入。
 - 数据库损坏或学习失败不会阻止主 Agent 继续工作；待处理事件持久化，下次启动可恢复。
@@ -448,8 +462,9 @@ Cache Read Ratio = cacheRead / (input + cacheRead + cacheWrite)
 数据库表：
 
 ```text
-memories            当前记忆（status / evidence / dedupe_key / rev / expires_at）
+memories            当前记忆（status / evidence / dedupe_key / rev / hit_count / last_hit_at）
 memory_revisions    变更历史与快照
+memory_hits         记忆触达日志（source = search / hint），用于计算命中覆盖
 observations        待提炼的事件队列（attempts 控制重试）
 usage_stats         session / learning / retrieval 用量
 meta                计数器与运行时状态

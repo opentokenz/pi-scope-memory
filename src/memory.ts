@@ -48,6 +48,9 @@ export interface MemoryRecord {
 	expiresAt: string | null;
 	verifiedAt: string | null;
 	rev: number;
+	/** How many times this memory was surfaced to an agent, across all sessions. */
+	hitCount: number;
+	lastHitAt: string | null;
 	createdAt: string;
 	updatedAt: string;
 }
@@ -60,13 +63,15 @@ export interface MemorySearchOptions {
 	limit?: number;
 	/** Internal lookups (dedupe, conflict detection) do not count as user searches. */
 	trackCall?: boolean;
+	/** Session that receives the results; attached to the hit log entries. */
+	sessionId?: string;
 }
 
 export interface MemorySearchHit {
 	memory: MemoryRecord;
 	score: number;
 	snippet: string;
-	matchedBy: "fts" | "substring" | "recent";
+	matchedBy: "fts" | "substring" | "recent" | "evidence";
 }
 
 export interface MemorySearchResult {
@@ -220,8 +225,22 @@ export function searchMemories(
 	const queryTokens = tokenize(query);
 
 	if (query !== "") {
+		// A path query is answered by evidence, not by text similarity: the path can
+		// be absent from both title and content, and full-text search ranks it by
+		// accident. Measured on real sessions, this is worth roughly double the
+		// precision and recall of the FTS path at no extra token cost.
+		const pathQueries = pathQueryCandidates(query, scope, options.repo);
+		for (const pathQuery of pathQueries) {
+			const found = runEvidence(db, filter, statuses, pathQuery, limit);
+			if (found.length === 0) continue;
+			for (const row of found) rows.set(String(row.id), { row, matchedBy: "evidence" });
+			break;
+		}
 		for (const row of runFts(db, filter, statuses, query, limit, CANDIDATE_LIMIT)) {
-			rows.set(String(row.id), { row, matchedBy: "fts" });
+			const id = String(row.id);
+			// Evidence wins: downgrading it to "fts" would drop the structural match
+			// back to token overlap and lose the ranking boost.
+			if (!rows.has(id)) rows.set(id, { row, matchedBy: "fts" });
 		}
 		const substringRows = runSubstring(db, filter, statuses, query, CANDIDATE_LIMIT);
 		for (const row of substringRows) {
@@ -260,9 +279,55 @@ export function searchMemories(
 	if (query !== "" && options.trackCall !== false) {
 		incrementMeta(db, "search_calls");
 		if (budgeted.length === 0) incrementMeta(db, "search_zero");
+		if (budgeted.length > 0) {
+			// Record hits only for memories actually returned; the internal dedupe
+			// lookup during a save must never look like usage.
+			const hitAt = recordMemoryHits(
+				db,
+				options.sessionId ?? "unknown",
+				budgeted.map((hit) => hit.memory.id),
+				"search",
+			);
+			for (const hit of budgeted) {
+				hit.memory.hitCount += 1;
+				hit.memory.lastHitAt = hitAt;
+			}
+		}
 	}
 
 	return { hits: budgeted, candidates: hits.length };
+}
+
+/**
+ * Marks memories as surfaced to the agent and appends one log row per memory.
+ * "Surfaced" covers both explicit search results and path-triggered hints, so a
+ * memory recalled through a hint is not counted as unused.
+ */
+export function recordMemoryHits(
+	db: MemoryDb,
+	sessionId: string,
+	memoryIds: string[],
+	source: "search" | "hint",
+): string {
+	const hitAt = nowIso();
+	const bump = db.sqlite.prepare("UPDATE memories SET hit_count = hit_count + 1, last_hit_at = ? WHERE id = ?");
+	const log = db.sqlite.prepare(
+		"INSERT INTO memory_hits (memory_id, session_id, source, created_at) VALUES (?, ?, ?, ?)",
+	);
+	const unique = [...new Set(memoryIds)];
+	withTransaction(db, () => {
+		for (const id of unique) {
+			bump.run(hitAt, id);
+			log.run(id, sessionId, source, hitAt);
+		}
+	});
+	return hitAt;
+}
+
+/** Memory ids already surfaced to this session, read from the hit log. */
+export function surfacedMemoryIds(db: MemoryDb, sessionId: string): Set<string> {
+	const rows = db.sqlite.prepare("SELECT DISTINCT memory_id FROM memory_hits WHERE session_id = ?").all(sessionId);
+	return new Set(rows.map((row) => String(row.memory_id)));
 }
 
 export function getMemory(db: MemoryDb, id: string): MemoryRecord | undefined {
@@ -766,6 +831,9 @@ export function clearMemories(db: MemoryDb, scope: ResolvedScope, target: ClearT
 				`DELETE FROM memory_revisions WHERE memory_id IN (SELECT id FROM memories WHERE ${filter.sql})`,
 			)
 			.run(...filter.params);
+		db.sqlite
+			.prepare(`DELETE FROM memory_hits WHERE memory_id IN (SELECT id FROM memories WHERE ${filter.sql})`)
+			.run(...filter.params);
 		db.sqlite.prepare(`DELETE FROM memories WHERE ${filter.sql}`).run(...filter.params);
 		if (target.kind === "all") {
 			db.sqlite.prepare("DELETE FROM observations").run();
@@ -930,6 +998,81 @@ function runFts(
 	}
 }
 
+interface PathQuery {
+	repoId: string;
+	rel: string;
+}
+
+/**
+ * Recognises a query that names a repository path instead of asking a question.
+ * A separator is required: a bare word such as "pom.xml" is too easy to confuse
+ * with an ordinary search term.
+ *
+ * Two readings are possible and a repository id can legitimately appear as the
+ * first segment of its own relative path (a nested project directory), so both
+ * are returned and the caller takes the first that matches evidence.
+ */
+function pathQueryCandidates(query: string, scope: ResolvedScope, requestedRepo?: string): PathQuery[] {
+	const cleaned = query
+		.trim()
+		.replace(/^['"`]+/, "")
+		.replace(/['"`]+$/, "")
+		.replace(/^\.\//, "")
+		.replace(/\/+$/, "");
+	if (cleaned === "" || !cleaned.includes("/") || /\s/.test(cleaned)) return [];
+
+	const head = cleaned.slice(0, cleaned.indexOf("/"));
+	const rest = cleaned.slice(head.length + 1);
+	const stripped: PathQuery | undefined =
+		rest !== "" && scope.repos.some((repo) => repo.id === head) ? { repoId: head, rel: rest } : undefined;
+	const pinnedRepo = requestedRepo ?? scope.repoId;
+	const whole: PathQuery | undefined = pinnedRepo === undefined ? undefined : { repoId: pinnedRepo, rel: cleaned };
+
+	// A caller that pinned `repo` meant that path literally; otherwise the explicit
+	// `repo/path` form is the more specific reading.
+	const ordered = requestedRepo === undefined ? [stripped, whole] : [whole, stripped];
+	const out: PathQuery[] = [];
+	for (const candidate of ordered) {
+		if (!candidate) continue;
+		if (out.some((item) => item.repoId === candidate.repoId && item.rel === candidate.rel)) continue;
+		out.push(candidate);
+	}
+	return out;
+}
+
+/** Memories whose stored code evidence covers `repoId/rel`. */
+function runEvidence(
+	db: MemoryDb,
+	filter: Filter,
+	statuses: MemoryStatus[],
+	target: PathQuery,
+	limit: number,
+): Record<string, unknown>[] {
+	const statusSql = `m.status IN (${statuses.map(() => "?").join(",")})`;
+	// No LIKE prefilter: a memory may cite a directory (`src/x`) that covers the
+	// queried file only as a prefix, which a substring match on the full path
+	// misses. This is the scan `memoriesForPath` already does per file touch, and
+	// the table is small enough for it to stay cheap.
+	const rows = db.sqlite
+		.prepare(
+			`SELECT m.*, NULL AS rank FROM memories m
+			 WHERE ${filter.sql} AND ${statusSql}
+			 ORDER BY m.updated_at DESC
+			 LIMIT 2000`,
+		)
+		.all(...filter.params, ...statuses) as Record<string, unknown>[];
+	const matched = rows.filter((row) => {
+		const evidence = parseJsonArray<MemoryEvidence>(row.evidence_json);
+		return evidence.some(
+			(item) =>
+				item.repo === target.repoId &&
+				item.path !== undefined &&
+				(item.path === target.rel || target.rel.startsWith(`${item.path}/`)),
+		);
+	});
+	return matched.slice(0, limit);
+}
+
 function runSubstring(
 	db: MemoryDb,
 	filter: Filter,
@@ -976,8 +1119,16 @@ function scoreMemory(
 	normalizedQuery: string,
 	matchedBy: MemorySearchHit["matchedBy"],
 ): { score: number; relevant: boolean } {
-	const base = matchedBy === "fts" ? 1 : matchedBy === "substring" ? 0.55 : 0.1;
 	const tokens = new Set(tokenize(`${memory.title}\n${memory.content}\n${memory.tags.join(" ")}`));
+	const ageDays = Math.max(0, (Date.now() - Date.parse(memory.updatedAt)) / 86_400_000);
+	const recency = Math.max(0, 1 - ageDays / 365) * 0.05;
+	// An evidence match is a structural fact: the caller asked about this path and
+	// this memory cites it. No token overlap is needed, so it skips the relevance
+	// heuristics below and outranks every text match.
+	if (matchedBy === "evidence") {
+		return { score: 3 * STATUS_WEIGHT[memory.status] * KIND_WEIGHT[memory.kind] + recency, relevant: true };
+	}
+	const base = matchedBy === "fts" ? 1 : matchedBy === "substring" ? 0.55 : 0.1;
 	const overlap = jaccard(queryTokens, tokens);
 	const coverage = coverageOf(queryTokens, tokens);
 	const queryTokenList = [...queryTokens];
@@ -992,8 +1143,6 @@ function scoreMemory(
 	)
 		? 0.25
 		: 0;
-	const ageDays = Math.max(0, (Date.now() - Date.parse(memory.updatedAt)) / 86_400_000);
-	const recency = Math.max(0, 1 - ageDays / 365) * 0.05;
 	// A shared token proves nothing on its own: generic Chinese bigrams such as
 	// "规则" or "测试" appear in unrelated memories. Require a distinctive token,
 	// or several weaker ones with enough query coverage. Short queries (one or two
@@ -1384,6 +1533,8 @@ function rowToMemory(row: Record<string, unknown>): MemoryRecord {
 		expiresAt: row.expires_at === null || row.expires_at === undefined ? null : String(row.expires_at),
 		verifiedAt: row.verified_at === null || row.verified_at === undefined ? null : String(row.verified_at),
 		rev: Number(row.rev ?? 1),
+		hitCount: Number(row.hit_count ?? 0),
+		lastHitAt: row.last_hit_at === null || row.last_hit_at === undefined ? null : String(row.last_hit_at),
 		createdAt: String(row.created_at),
 		updatedAt: String(row.updated_at),
 	};

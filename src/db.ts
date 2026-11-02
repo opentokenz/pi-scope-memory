@@ -5,7 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { backupPath, databasePath, scopeDataDir } from "./config.ts";
 
 /** Bump together with the DDL below; `PRAGMA user_version` stores it. */
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 export interface MemoryDb {
 	scopeId: string;
@@ -128,24 +128,33 @@ function migrate(db: MemoryDb): void {
 	if (current > SCHEMA_VERSION) {
 		throw new Error(`数据库 schema 版本 ${current} 高于当前扩展支持的 ${SCHEMA_VERSION}`);
 	}
-	if (current === 0) {
-		// DDL_V1 still creates the original FTS table; migrateFtsToTrigram
-		// immediately replaces it with the trigram index used from version 2 on.
-		db.sqlite.exec(DDL_V1);
-		db.sqlite.exec("PRAGMA user_version = 1");
-		migrateFtsToTrigram(db);
-		db.sqlite.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-		return;
+	// A file created by this call has nothing to lose yet, so it skips the
+	// pre-migration backup that every real upgrade takes.
+	const createdNow = current === 0;
+	let version = current;
+	while (version < SCHEMA_VERSION) {
+		if (!createdNow) backupDatabase(db);
+		version = applyMigration(db, version);
+		db.sqlite.exec(`PRAGMA user_version = ${version}`);
 	}
-	if (current === 1) {
-		// Rebuilding the search index is not destructive, but keep the same
-		// backup guarantee as any other migration.
-		backupDatabase(db);
-		migrateFtsToTrigram(db);
-		db.sqlite.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
-		return;
+}
+
+function applyMigration(db: MemoryDb, version: number): number {
+	switch (version) {
+		case 0:
+			// DDL_V1 still creates the original FTS table; the next step replaces
+			// it with the trigram index used from version 2 on.
+			db.sqlite.exec(DDL_V1);
+			return 1;
+		case 1:
+			migrateFtsToTrigram(db);
+			return 2;
+		case 2:
+			migrateAddHitTracking(db);
+			return 3;
+		default:
+			throw new Error(`未知的数据库 schema 版本: ${version}`);
 	}
-	throw new Error(`未知的数据库 schema 版本: ${current}`);
 }
 
 /**
@@ -163,6 +172,27 @@ function migrateFtsToTrigram(db: MemoryDb): void {
   tokenize='trigram'
 )`);
 	db.sqlite.exec("INSERT INTO memory_fts(memory_fts) VALUES('rebuild')");
+}
+
+/**
+ * Version 3 records whether stored knowledge is actually recalled. `hit_count`
+ * keeps the hot path cheap, while `memory_hits` keeps the history so coverage
+ * can be measured over a window instead of only as a lifetime total.
+ */
+function migrateAddHitTracking(db: MemoryDb): void {
+	db.sqlite.exec(`
+ALTER TABLE memories ADD COLUMN hit_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE memories ADD COLUMN last_hit_at TEXT;
+CREATE TABLE IF NOT EXISTS memory_hits (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  memory_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  source TEXT NOT NULL CHECK (source IN ('search','hint')),
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_memory_hits_memory ON memory_hits(memory_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_memory_hits_time ON memory_hits(created_at);
+`);
 }
 
 const DDL_V1 = `

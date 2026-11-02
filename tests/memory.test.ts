@@ -764,6 +764,157 @@ test("仓库参数不能逃逸当前 Scope", () => {
 	}
 });
 
+test("检索命中会累计命中次数并写入明细", () => {
+	const fx = fixture();
+	try {
+		const saved = save(fx, fx.backend, {
+			kind: "fact",
+			title: "Backend 连接池",
+			content: "Backend 使用 HikariCP 作为连接池。",
+			evidence: [{ repo: "backend", path: "src/db.ts" }],
+		});
+		const id = firstId(saved.id);
+
+		const first = searchMemories(
+			fx.db,
+			fx.backend,
+			{ query: "HikariCP", sessionId: "session-1" },
+			fx.config.defaults.retrieval,
+		);
+		assert.equal(first.hits.length, 1);
+		assert.equal(first.hits[0]?.memory.hitCount, 1, "返回的记忆应带上本次命中后的次数");
+
+		let row = fx.db.sqlite.prepare("SELECT hit_count, last_hit_at FROM memories WHERE id = ?").get(id);
+		assert.equal(Number(row?.hit_count), 1);
+		assert.equal(typeof row?.last_hit_at, "string");
+
+		searchMemories(
+			fx.db,
+			fx.backend,
+			{ query: "HikariCP", sessionId: "session-1" },
+			fx.config.defaults.retrieval,
+		);
+		row = fx.db.sqlite.prepare("SELECT hit_count FROM memories WHERE id = ?").get(id);
+		assert.equal(Number(row?.hit_count), 2);
+
+		const log = fx.db.sqlite
+			.prepare("SELECT source, session_id FROM memory_hits WHERE memory_id = ? ORDER BY id")
+			.all(id);
+		assert.deepEqual(
+			log.map((entry) => [String(entry.source), String(entry.session_id)]),
+			[
+				["search", "session-1"],
+				["search", "session-1"],
+			],
+		);
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+test("写入前的内部检索不计入命中", () => {
+	const fx = fixture();
+	try {
+		const input = {
+			kind: "fact" as const,
+			title: "Backend 连接池",
+			content: "Backend 使用 HikariCP 作为连接池。",
+			evidence: [{ repo: "backend", path: "src/db.ts" }],
+		};
+		const saved = save(fx, fx.backend, input);
+		// 重复保存会先检索同层历史记忆，这一步是内部去重，不能算作记忆被使用。
+		save(fx, fx.backend, input);
+		const row = fx.db.sqlite.prepare("SELECT hit_count FROM memories WHERE id = ?").get(firstId(saved.id));
+		assert.equal(Number(row?.hit_count), 0);
+		const log = fx.db.sqlite.prepare("SELECT count(*) AS n FROM memory_hits").get();
+		assert.equal(Number(log?.n), 0);
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+test("统计包含命中覆盖与从未命中", () => {
+	const fx = fixture();
+	try {
+		save(fx, fx.backend, {
+			kind: "fact",
+			title: "Backend 连接池",
+			content: "Backend 使用 HikariCP 作为连接池。",
+			evidence: [{ repo: "backend", path: "src/db.ts" }],
+		});
+		save(fx, fx.backend, {
+			kind: "fact",
+			title: "刷新令牌实现",
+			content: "刷新令牌由 refresh 函数负责。",
+			evidence: [{ repo: "backend", path: "src/auth/refresh.ts" }],
+		});
+		searchMemories(
+			fx.db,
+			fx.backend,
+			{ query: "HikariCP", sessionId: "session-1" },
+			fx.config.defaults.retrieval,
+		);
+
+		const stats = collectStats(fx.db, fx.backend, fx.config.defaults);
+		assert.equal(stats.hitsRecent, 1, "近 7 日被触达的记忆数");
+		assert.equal(stats.neverHit, 1);
+		const text = formatStats(stats, "enterprise");
+		assert.match(text, /Hit Coverage\s+50% \(1\/2/);
+		assert.match(text, /Never Hit\s+1/);
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+test("路径查询直接命中引用该路径的记忆", () => {
+	const fx = fixture();
+	try {
+		const saved = save(fx, fx.backend, {
+			kind: "constraint",
+			title: "连接池配置约定",
+			content: "数据源必须统一从配置类读取，禁止就地新建。",
+			evidence: [{ repo: "backend", path: "src/db.ts" }],
+		});
+		const id = firstId(saved.id);
+
+		// 查询是一个纯路径：文本上与记忆内容毫无重叠，只能靠证据匹配命中。
+		const hits = searchMemories(
+			fx.db,
+			fx.backend,
+			{ query: "src/db.ts", sessionId: "session-1" },
+			fx.config.defaults.retrieval,
+		);
+		assert.equal(hits.hits.length, 1);
+		assert.equal(hits.hits[0]?.memory.id, id);
+		assert.equal(hits.hits[0]?.matchedBy, "evidence");
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
+test("仓库名出现在自身相对路径里时仍能命中证据", () => {
+	const fx = fixture();
+	try {
+		// 仓库根下还有一层同名工程目录，证据路径与仓库 id 前缀相同。
+		const saved = save(fx, fx.backend, {
+			kind: "fact",
+			title: "内层工程目录",
+			content: "Maven reactor 在内层工程目录里。",
+			evidence: [{ repo: "backend", path: "backend/pom.xml" }],
+		});
+		const hits = searchMemories(
+			fx.db,
+			fx.backend,
+			{ query: "backend/pom.xml", repo: "backend", sessionId: "session-1" },
+			fx.config.defaults.retrieval,
+		);
+		assert.equal(hits.hits[0]?.memory.id, firstId(saved.id));
+		assert.equal(hits.hits[0]?.matchedBy, "evidence");
+	} finally {
+		closeMemoryDb(fx.db);
+	}
+});
+
 function firstId(id: string | undefined): string {
 	assert.ok(id);
 	return id;

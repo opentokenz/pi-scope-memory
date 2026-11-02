@@ -15,6 +15,13 @@ export interface CacheConfig {
 	trackUsage: boolean;
 }
 
+export interface BriefConfig {
+	/** Put a short memory brief in the system prompt for the whole session. */
+	enabled: boolean;
+	/** Character budget; the brief is diffed, so it must stay fixed per session. */
+	maxChars: number;
+}
+
 export const LEARNING_THINKING_LEVELS = [
 	"inherit",
 	"off",
@@ -39,6 +46,7 @@ export interface DefaultsConfig {
 	learningTokenBudgetPerDay: number;
 	retrieval: RetrievalConfig;
 	cache: CacheConfig;
+	brief: BriefConfig;
 }
 
 export interface ScopeConfig {
@@ -84,6 +92,10 @@ export const DEFAULT_DEFAULTS: DefaultsConfig = {
 	cache: {
 		dynamicInjection: false,
 		trackUsage: true,
+	},
+	brief: {
+		enabled: true,
+		maxChars: 2000,
 	},
 };
 
@@ -274,6 +286,19 @@ function parseDefaults(value: unknown): DefaultsConfig {
 		readBoolean(cache.dynamicInjection, "defaults.cache.dynamicInjection", defaults.cache.dynamicInjection);
 		defaults.cache.dynamicInjection = false;
 		defaults.cache.trackUsage = readBoolean(cache.trackUsage, "defaults.cache.trackUsage", defaults.cache.trackUsage);
+	}
+
+	const brief = value.brief;
+	if (brief !== undefined) {
+		if (!isRecord(brief)) throw new ConfigError("defaults.brief 必须是对象");
+		defaults.brief.enabled = readBoolean(brief.enabled, "defaults.brief.enabled", defaults.brief.enabled);
+		defaults.brief.maxChars = readInteger(
+			brief.maxChars,
+			"defaults.brief.maxChars",
+			defaults.brief.maxChars,
+			200,
+			8000,
+		);
 	}
 
 	return defaults;

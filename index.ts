@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext, MessageEndEvent } from "@earendil-works/pi-coding-agent";
+import { buildBrief } from "./src/brief.ts";
 import { registerSmCommand } from "./src/commands.ts";
 import { DEFAULT_DEFAULTS, errorMessage, loadConfig } from "./src/config.ts";
 import { closeMemoryDb, getMeta, openMemoryDb, setMeta, type MemoryDb } from "./src/db.ts";
@@ -25,6 +26,15 @@ export default function scopeMemoryExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_start", async (_event, ctx) => {
 		await startSession(pi, runtime, ctx);
+	});
+
+	// The brief is built once in session_start and only re-attached here. Pi diffs
+	// prompt sections by content, so a stable brief adds no system message and no
+	// cache miss after the first turn.
+	pi.on("before_agent_start", async (event) => {
+		if (!runtime.active || !runtime.brief) return;
+		const options = event.systemPromptOptions;
+		options.sections = { ...options.sections, "memory-brief": runtime.brief };
 	});
 
 	pi.on("tool_result", async (event, ctx) => {
@@ -106,7 +116,9 @@ async function startSession(pi: ExtensionAPI, runtime: MemoryRuntime, ctx: Exten
 	runtime.sessionId = safeSessionId(ctx);
 	runtime.checkedPaths.clear();
 	runtime.hintsShown = 0;
+	runtime.hintTokens = 0;
 	runtime.hintPending = false;
+	runtime.brief = undefined;
 
 	const loaded = loadConfig();
 	if (loaded.status === "missing") {
@@ -146,6 +158,14 @@ async function startSession(pi: ExtensionAPI, runtime: MemoryRuntime, ctx: Exten
 	runtime.scope = resolution.resolved;
 	runtime.active = true;
 	activateMemoryTools(pi);
+
+	try {
+		runtime.brief = buildBrief(db, resolution.resolved, runtime.defaults.brief);
+	} catch (error) {
+		// A broken brief must never block the session; the tools still work.
+		runtime.brief = undefined;
+		reportQuietly(ctx, `记忆快照生成失败: ${errorMessage(error)}`);
+	}
 
 	try {
 		runFreshnessCheckIfDue(db, resolution.resolved);

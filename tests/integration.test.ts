@@ -326,19 +326,63 @@ test("读取证据文件时追加一次性记忆提示", async () => {
 	await h.shutdown();
 });
 
-test("每个会话最多追加 3 条路径提示", async () => {
+test("会话提示受 token 预算约束", async () => {
 	const { root } = enterpriseSetup();
 	const notices: string[] = [];
 	const h = harness(notices);
 	await h.sessionStart(makeCtx(join(root, "backend"), notices));
-	const names = ["a.ts", "b.ts", "c.ts", "d.ts"];
+	const body = "重复的约束描述，用于把正文撑长。".repeat(75);
+	const names = Array.from({ length: 10 }, (_, index) => `p${index}.ts`);
 	for (const name of names) {
-		writeFile(join(root, "backend"), `src/${name}`, `export const ${name.replace(".", "_")} = true;\n`);
+		writeFile(join(root, "backend"), `src/${name}`, "export const x = 1;\n");
 		await execute(h, "scope_memory_save", {
 			action: "upsert",
-			kind: "fact",
-			title: `${name} 的约定`,
-			content: `${name} 存放模块约定。`,
+			kind: "constraint",
+			title: `${name} 的约束`,
+			content: body,
+			evidence: [{ repo: "backend", path: `src/${name}` }],
+		});
+	}
+	const handler = h.handlers.get("tool_result");
+	assert.ok(handler);
+	const ctx = makeCtx(join(root, "backend"), notices) as unknown as ExtensionContext;
+	let hints = 0;
+	let tokens = 0;
+	for (const name of names) {
+		const result = (await handler(
+			{
+				type: "tool_result",
+				toolCallId: `read-${name}`,
+				toolName: "read",
+				input: { path: `src/${name}` },
+				content: [{ type: "text", text: "content" }],
+				isError: false,
+			},
+			ctx,
+		)) as { content?: { text: string }[] } | undefined;
+		const text = result?.content?.at(-1)?.text ?? "";
+		if (!text.includes("长期记忆提示")) continue;
+		hints += 1;
+		tokens += Math.ceil(text.length / 2.5);
+	}
+	assert.ok(hints > 0 && hints < names.length, `预算应提前截断，实际 ${hints} 次`);
+	assert.ok(tokens <= 5000, `提示 token 超出会话预算: ${tokens}`);
+	await h.shutdown();
+});
+
+test("会话提示次数有硬上限", async () => {
+	const { root } = enterpriseSetup();
+	const notices: string[] = [];
+	const h = harness(notices);
+	await h.sessionStart(makeCtx(join(root, "backend"), notices));
+	const names = Array.from({ length: 40 }, (_, index) => `q${index}.ts`);
+	for (const name of names) {
+		writeFile(join(root, "backend"), `src/${name}`, "export const x = 1;\n");
+		await execute(h, "scope_memory_save", {
+			action: "upsert",
+			kind: "constraint",
+			title: `${name} 的约束`,
+			content: `短约束 ${name}。`,
 			evidence: [{ repo: "backend", path: `src/${name}` }],
 		});
 	}
@@ -360,7 +404,7 @@ test("每个会话最多追加 3 条路径提示", async () => {
 		)) as { content?: { text: string }[] } | undefined;
 		if (result?.content?.some((part) => part.text.includes("长期记忆提示"))) hints += 1;
 	}
-	assert.equal(hints, 3);
+	assert.equal(hints, 30);
 	await h.shutdown();
 });
 
@@ -944,16 +988,26 @@ test("/sm clear 默认只预览，--yes 才删除并生成备份", async () => {
 	await h.shutdown();
 });
 
-test("扩展不注册每轮上下文注入钩子（Prompt Cache 保障）", () => {
+test("每轮消息不被改写（Prompt Cache 保障）", () => {
 	const notices: string[] = [];
 	const h = harness(notices);
-	const allowed = new Set(["session_start", "tool_result", "turn_end", "message_end", "agent_settled", "session_shutdown"]);
+	// 逐轮改写会话消息会打碎前缀缓存，这条仍然禁止。
+	assert.equal(h.handlers.has("context"), false);
+	assert.equal(h.handlers.has("context_with_system"), false);
+	// before_agent_start 允许：它只写一个会话内字节不变的 section，Pi 按内容
+	// diff，内容不变就不产生补丁。稳定性由下面的快照测试保证。
+	const allowed = new Set([
+		"session_start",
+		"before_agent_start",
+		"tool_result",
+		"turn_end",
+		"message_end",
+		"agent_settled",
+		"session_shutdown",
+	]);
 	for (const event of h.handlers.keys()) {
 		assert.ok(allowed.has(event), `不应注册 ${event} 钩子`);
 	}
-	assert.equal(h.handlers.has("before_agent_start"), false);
-	assert.equal(h.handlers.has("context"), false);
-	assert.equal(h.handlers.has("context_with_system"), false);
 });
 
 test("同一 Scope 多进程并发写入不会互相覆盖", async () => {
@@ -986,4 +1040,232 @@ test("同一 Scope 多进程并发写入不会互相覆盖", async () => {
 	assert.match(all.text, /前端重构后运行类型检查/);
 	assert.ok(existsSync(join(dataDir, "scopes", "enterprise", "memory.sqlite")));
 	await reopened.shutdown();
+});
+
+async function hintFor(h: Harness, command: string, ctx: ExtensionContext): Promise<string> {
+	const handler = h.handlers.get("tool_result");
+	assert.ok(handler);
+	const result = (await handler(
+		{
+			type: "tool_result",
+			toolCallId: `bash-${command}`,
+			toolName: "bash",
+			input: { command },
+			content: [{ type: "text", text: "bash output" }],
+			isError: false,
+		},
+		ctx,
+	)) as { content?: { type: string; text: string }[] } | undefined;
+	return result?.content?.at(-1)?.text ?? "";
+}
+
+test("bash 命令里出现的证据文件触发记忆提示，并直接带正文", async () => {
+	const { root } = enterpriseSetup();
+	const notices: string[] = [];
+	const h = harness(notices);
+	await h.sessionStart(makeCtx(join(root, "backend"), notices));
+	await execute(h, "scope_memory_save", {
+		action: "upsert",
+		kind: "constraint",
+		title: "连接池统一使用 HikariCP",
+		content: "Backend 所有数据源必须使用 HikariCP，禁止自建连接池。",
+		evidence: [{ repo: "backend", path: "src/db.ts" }],
+	});
+
+	const ctx = makeCtx(join(root, "backend"), notices) as unknown as ExtensionContext;
+	const appended = await hintFor(h, `cd ${join(root, "backend")} && sed -n 1,20p src/db.ts`, ctx);
+	assert.match(appended, /长期记忆提示/);
+	assert.match(appended, /HikariCP/);
+	assert.match(appended, /禁止自建连接池/, "提示必须带正文，只给标题时模型不会去检索");
+	assert.match(appended, /scope_memory_search/, "提示应保留可照抄的检索入口");
+	await h.shutdown();
+});
+
+test("bash 里没有证据引用的路径不触发记忆提示", async () => {
+	const { root } = enterpriseSetup();
+	const notices: string[] = [];
+	const h = harness(notices);
+	await h.sessionStart(makeCtx(join(root, "backend"), notices));
+	await execute(h, "scope_memory_save", {
+		action: "upsert",
+		kind: "constraint",
+		title: "连接池统一使用 HikariCP",
+		content: "Backend 所有数据源必须使用 HikariCP，禁止自建连接池。",
+		evidence: [{ repo: "backend", path: "src/db.ts" }],
+	});
+
+	const ctx = makeCtx(join(root, "backend"), notices) as unknown as ExtensionContext;
+	writeFile(join(root, "backend"), "src/unrelated.ts", "export const x = 1;\n");
+	assert.equal(await hintFor(h, `cd ${join(root, "backend")} && cat src/unrelated.ts`, ctx), "");
+	assert.equal(await hintFor(h, "ls -la", ctx), "");
+	await h.shutdown();
+});
+
+test("提示正文受 token 预算约束", async () => {
+	const { root } = enterpriseSetup();
+	const notices: string[] = [];
+	const h = harness(notices);
+	await h.sessionStart(makeCtx(join(root, "backend"), notices));
+	await execute(h, "scope_memory_save", {
+		action: "upsert",
+		kind: "pitfall",
+		title: "连接池配置踩坑",
+		content: `连接池配置踩坑记录。${ "重复的约束描述，用于把正文撑长。".repeat(300) }`,
+		evidence: [{ repo: "backend", path: "src/db.ts" }],
+	});
+
+	const ctx = makeCtx(join(root, "backend"), notices) as unknown as ExtensionContext;
+	const appended = await hintFor(h, `cd ${join(root, "backend")} && cat src/db.ts`, ctx);
+	assert.match(appended, /长期记忆提示/);
+	assert.ok(appended.length < 2400, `提示正文过长: ${appended.length} 字符`);
+	await h.shutdown();
+});
+
+test("会话提示不重复已触达的记忆", async () => {
+	const { root } = enterpriseSetup();
+	const notices: string[] = [];
+	const h = harness(notices);
+	await h.sessionStart(makeCtx(join(root, "backend"), notices));
+	writeFile(join(root, "backend"), "src/x/a.ts", "export const a = 1;\n");
+	writeFile(join(root, "backend"), "src/x/b.ts", "export const b = 1;\n");
+	// 目录级证据会同时命中 a.ts 与 b.ts；另一条只引用 b.ts。
+	const shared = await execute(h, "scope_memory_save", {
+		action: "upsert",
+		kind: "constraint",
+		title: "src/x 下的模块约定",
+		content: "src/x 下所有模块必须导出命名常量。",
+		evidence: [{ repo: "backend", path: "src/x" }],
+	});
+	await execute(h, "scope_memory_save", {
+		action: "upsert",
+		kind: "pitfall",
+		title: "b.ts 的初始化顺序",
+		content: "b.ts 必顶在 a.ts 之后导入。",
+		evidence: [{ repo: "backend", path: "src/x/b.ts" }],
+	});
+	const sharedId = String((shared.details as { id?: string }).id ?? "");
+	assert.ok(sharedId);
+
+	const ctx = makeCtx(join(root, "backend"), notices) as unknown as ExtensionContext;
+	const first = await hintFor(h, `cd ${join(root, "backend")} && cat src/x/a.ts`, ctx);
+	assert.match(first, /长期记忆提示/);
+	assert.ok(first.includes(sharedId), "首个提示应包含目录级记忆");
+
+	const second = await hintFor(h, `cd ${join(root, "backend")} && cat src/x/b.ts`, ctx);
+	assert.match(second, /长期记忆提示/);
+	assert.ok(!second.includes(sharedId), "同一条记忆不应在会话内重复提示");
+	assert.match(second, /初始化顺序/);
+	await h.shutdown();
+});
+
+test("候选记忆都已触达时不再消耗提示预算", async () => {
+	const { root } = enterpriseSetup();
+	const notices: string[] = [];
+	const h = harness(notices);
+	await h.sessionStart(makeCtx(join(root, "backend"), notices));
+	writeFile(join(root, "backend"), "src/y/a.ts", "export const a = 1;\n");
+	writeFile(join(root, "backend"), "src/y/b.ts", "export const b = 1;\n");
+	await execute(h, "scope_memory_save", {
+		action: "upsert",
+		kind: "constraint",
+		title: "src/y 下的模块约定",
+		content: "src/y 下所有模块必须导出命名常量。",
+		evidence: [{ repo: "backend", path: "src/y" }],
+	});
+
+	const ctx = makeCtx(join(root, "backend"), notices) as unknown as ExtensionContext;
+	assert.match(await hintFor(h, `cd ${join(root, "backend")} && cat src/y/a.ts`, ctx), /长期记忆提示/);
+	assert.equal(await hintFor(h, `cd ${join(root, "backend")} && cat src/y/b.ts`, ctx), "");
+	await h.shutdown();
+});
+
+test("检索指引只在首个提示里出现，避免重复占用预算", async () => {
+	const { root } = enterpriseSetup();
+	const notices: string[] = [];
+	const h = harness(notices);
+	await h.sessionStart(makeCtx(join(root, "backend"), notices));
+	for (const name of ["m1.ts", "m2.ts"]) {
+		writeFile(join(root, "backend"), `src/${name}`, "export const x = 1;\n");
+		await execute(h, "scope_memory_save", {
+			action: "upsert",
+			kind: "constraint",
+			title: `${name} 的约束`,
+			content: `${name} 必须导出命名常量。`,
+			evidence: [{ repo: "backend", path: `src/${name}` }],
+		});
+	}
+	const ctx = makeCtx(join(root, "backend"), notices) as unknown as ExtensionContext;
+	const first = await hintFor(h, `cd ${join(root, "backend")} && cat src/m1.ts`, ctx);
+	const second = await hintFor(h, `cd ${join(root, "backend")} && cat src/m2.ts`, ctx);
+	assert.match(first, /scope_memory_search\(query=/);
+	assert.match(second, /长期记忆提示/);
+	assert.match(second, /必须导出命名常量/);
+	assert.doesNotMatch(second, /scope_memory_search/, "后续提示不应再重复检索指引");
+	assert.ok(second.length < first.length, "去掉指引后的提示应该更短");
+	await h.shutdown();
+});
+
+interface BeforeStartEvent {
+	type: string;
+	messageType: string;
+	prompt: string;
+	systemPromptOptions: { sections: Record<string, string>; forceSystemPrompt?: string };
+}
+
+function beforeStartEvent(): BeforeStartEvent {
+	return {
+		type: "before_agent_start",
+		messageType: "user",
+		prompt: "继续",
+		systemPromptOptions: { sections: {} },
+	};
+}
+
+test("会话启动把记忆快照注入 system prompt，且同一会话内字节稳定", async () => {
+	const { root } = enterpriseSetup();
+	const notices: string[] = [];
+	const seed = harness(notices);
+	await seed.sessionStart(makeCtx(join(root, "backend"), notices, { sessionId: "seed" }));
+	await execute(seed, "scope_memory_save", {
+		action: "upsert",
+		kind: "constraint",
+		title: "权限校验必须走拦截器",
+		content: "所有写操作必须经过拦截器校验 subjectId。",
+		evidence: [{ repo: "backend", path: "src/db.ts" }],
+	});
+	await seed.shutdown();
+
+	const reader = harness(notices);
+	await reader.sessionStart(makeCtx(join(root, "backend"), notices, { sessionId: "reader" }));
+	const handler = reader.handlers.get("before_agent_start");
+	assert.ok(handler);
+	const ctx = makeCtx(join(root, "backend"), notices, { sessionId: "reader" }) as unknown as ExtensionContext;
+
+	const first = beforeStartEvent();
+	await handler(first, ctx);
+	const second = beforeStartEvent();
+	await handler(second, ctx);
+
+	const text = first.systemPromptOptions.sections["memory-brief"] ?? "";
+	assert.match(text, /权限校验必须走拦截器/);
+	assert.match(text, /scope_memory_search/);
+	assert.equal(text, second.systemPromptOptions.sections["memory-brief"], "同一会话内快照必须字节稳定");
+	// 只改 section，不强制替换整段 system prompt。
+	assert.equal(first.systemPromptOptions.forceSystemPrompt, undefined);
+	await reader.shutdown();
+});
+
+test("未激活目录不注入记忆快照", async () => {
+	const base = tempRoot();
+	useIsolatedHome(base);
+	const outside = join(base, "unrelated");
+	const notices: string[] = [];
+	const h = harness(notices);
+	await h.sessionStart(makeCtx(outside, notices));
+	const handler = h.handlers.get("before_agent_start");
+	assert.ok(handler);
+	const event = beforeStartEvent();
+	await handler(event, makeCtx(outside, notices) as unknown as ExtensionContext);
+	assert.equal(event.systemPromptOptions.sections["memory-brief"], undefined);
+	await h.shutdown();
 });

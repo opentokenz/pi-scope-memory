@@ -30,6 +30,12 @@ export interface ScopeStats {
 	verificationFailures: number;
 	hintsShown: number;
 	hintsFollowed: number;
+	/** Distinct memories surfaced to an agent in the last seven days. */
+	hitsRecent: number;
+	/** Memories that were never surfaced once since they were written. */
+	neverHit: number;
+	/** Share of recent context tokens that came from memory retrieval. */
+	retrievalShare: number | null;
 	lastLearningAt?: string;
 	lastLearningError?: string;
 }
@@ -43,6 +49,7 @@ export function collectStats(db: MemoryDb, scope: ResolvedScope, defaults: Defau
 	for (const row of db.sqlite.prepare("SELECT operation, count(*) AS n FROM memory_revisions GROUP BY operation").all()) {
 		revisionOps[String(row.operation)] = Number(row.n);
 	}
+	const window = recentWindow(db, scope);
 	return {
 		scopeId: scope.scopeId,
 		repoId: scope.repoId,
@@ -62,6 +69,9 @@ export function collectStats(db: MemoryDb, scope: ResolvedScope, defaults: Defau
 		verificationFailures: getMetaNumber(db, "verification_failures"),
 		hintsShown: getMetaNumber(db, "hint_shown"),
 		hintsFollowed: getMetaNumber(db, "hint_followed"),
+		hitsRecent: window.hits,
+		neverHit: window.neverHit,
+		retrievalShare: window.share,
 		lastLearningAt: getMeta(db, "last_learning_at"),
 		lastLearningError: getMeta(db, "last_learning_error"),
 	};
@@ -83,6 +93,10 @@ export function formatStats(stats: ScopeStats, scopeName: string, repoName?: str
 	const zeroRate = stats.searchCalls > 0 ? `${Math.round((stats.searchZeroCalls / stats.searchCalls) * 100)}%` : "无数据";
 	const reviewCount = stats.byStatus.review ?? 0;
 	const reviewRate = stats.total > 0 ? `${Math.round((reviewCount / stats.total) * 100)}%` : "无数据";
+	const hitCoverage =
+		active > 0 ? `${Math.round((stats.hitsRecent / active) * 100)}% (${stats.hitsRecent}/${active} active, 近 7 日)` : "无数据";
+	const retrievalShare =
+		stats.retrievalShare === null ? "无数据" : `${(stats.retrievalShare * 100).toFixed(2)}% (近 7 日)`;
 	const updates = stats.revisionOps.update ?? 0;
 	const supersedes = stats.revisionOps.supersede ?? 0;
 	const lines = [
@@ -95,6 +109,9 @@ export function formatStats(stats: ScopeStats, scopeName: string, repoName?: str
 		`Updates/Supersedes   ${updates}/${supersedes}`,
 		`Reverify             ${stats.revisionOps.reverify ?? 0}`,
 		`Memory Hints         shown ${stats.hintsShown} · followed ${stats.hintsFollowed}`,
+		`Hit Coverage         ${hitCoverage}`,
+		`Never Hit            ${stats.neverHit}`,
+		`Retrieval Share      ${retrievalShare}`,
 		`Cache Read Ratio     ${cacheRatio}`,
 		`Learning Tokens      ${formatTokens(stats.learning.input + stats.learning.output)} (今日 ${budget})`,
 		`Retrieval Tokens     ${stats.retrievalTokens}`,
@@ -201,6 +218,51 @@ function totals(db: MemoryDb, source: string): TokenTotals {
 		cacheRead: row ? Number(row.cacheRead) : 0,
 		cacheWrite: row ? Number(row.cacheWrite) : 0,
 		cost: row ? Number(row.cost) : 0,
+	};
+}
+
+interface RecentWindow {
+	hits: number;
+	neverHit: number;
+	share: number | null;
+}
+
+const RECENT_WINDOW_DAYS = 7;
+
+/** Recall coverage over the last week; lifetime totals hide a store nobody reads. */
+function recentWindow(db: MemoryDb, scope: ResolvedScope): RecentWindow {
+	const since = new Date(Date.now() - RECENT_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
+	const registered = scope.repos.map((repo) => repo.id);
+	const scopeSql =
+		registered.length === 0
+			? "m.repo_id IS NULL"
+			: `(m.repo_id IS NULL OR m.repo_id IN (${registered.map(() => "?").join(",")}))`;
+	const hitRow = db.sqlite
+		.prepare(
+			`SELECT count(DISTINCT m.id) AS n FROM memories m
+			 JOIN memory_hits h ON h.memory_id = m.id
+			 WHERE h.created_at >= ? AND ${scopeSql}`,
+		)
+		.get(since, ...registered);
+	const neverRow = db.sqlite
+		.prepare(
+			`SELECT count(*) AS n FROM memories m
+			 WHERE m.status IN ('active','candidate','review') AND m.hit_count = 0 AND ${scopeSql}`,
+		)
+		.get(...registered);
+	const tokenRow = db.sqlite
+		.prepare(
+			`SELECT
+				(SELECT coalesce(sum(input_tokens), 0) FROM usage_stats WHERE source = 'retrieval' AND created_at >= ?) AS retrieved,
+				(SELECT coalesce(sum(input_tokens + cache_read_tokens + cache_write_tokens), 0) FROM usage_stats WHERE source = 'session' AND created_at >= ?) AS context`,
+		)
+		.get(since, since);
+	const retrieved = tokenRow ? Number(tokenRow.retrieved) : 0;
+	const context = tokenRow ? Number(tokenRow.context) : 0;
+	return {
+		hits: hitRow ? Number(hitRow.n) : 0,
+		neverHit: neverRow ? Number(neverRow.n) : 0,
+		share: context === 0 ? null : retrieved / context,
 	};
 }
 
